@@ -654,7 +654,7 @@ def extract_with_7z(
 ) -> None:
     executable = find_external_extractor(extractor)
     if not executable:
-        raise ArchiveUnsupportedError("RAR/7Z extraction requires 7zz, 7z, or 7za on PATH")
+        raise ArchiveUnsupportedError("7z extraction requires 7zz, 7z, or 7za on PATH")
 
     candidates: list[str | None] = [None] + passwords
     errors: list[str] = []
@@ -714,9 +714,14 @@ def extract_archive_to_dir(
     extract_dir: Path,
     passwords: list[str],
     extractor: str | None,
+    prefer_7z_for_zip: bool,
 ) -> None:
     if archive_kind.startswith("tar"):
         extract_tar_to_dir(archive_path, extract_dir)
+        return
+
+    if archive_kind == "zip" and prefer_7z_for_zip and find_external_extractor(extractor):
+        extract_with_7z(archive_path, extract_dir, passwords, extractor)
         return
 
     if archive_kind == "zip":
@@ -825,6 +830,7 @@ def preview_deep_unzip(
     delete_archives: bool,
     extractor: str | None,
     forced_extensions: dict[str, str] | None,
+    prefer_7z_for_zip: bool,
 ) -> int:
     candidates = list_archive_candidates(root, include_symlinks, forced_extensions)
     if not candidates:
@@ -834,6 +840,11 @@ def preview_deep_unzip(
     external_extractor = find_external_extractor(extractor)
     if any(kind in {"rar", "7z"} for _path, kind in candidates) and not external_extractor:
         print("Warning: RAR/7Z extraction requires 7zz, 7z, or 7za on PATH.")
+    if prefer_7z_for_zip:
+        if external_extractor:
+            print(f"ZIP archives will be extracted with: {external_extractor}")
+        else:
+            print("Warning: --prefer-7z was set, but 7zz/7z/7za was not found. ZIP extraction will use Python.")
 
     print(f"Found {len(candidates)} supported archive(s) under {root}")
     for path, kind in candidates:
@@ -866,13 +877,21 @@ def deep_unzip(
     delete_archives: bool,
     extractor: str | None,
     forced_extensions: dict[str, str] | None,
+    prefer_7z_for_zip: bool,
 ) -> int:
     if not root.exists():
         raise FileNotFoundError(root)
     if max_depth < 1:
         raise ValueError("--max-depth must be at least 1")
     if not apply:
-        return preview_deep_unzip(root, include_symlinks, delete_archives, extractor, forced_extensions)
+        return preview_deep_unzip(
+            root,
+            include_symlinks,
+            delete_archives,
+            extractor,
+            forced_extensions,
+            prefer_7z_for_zip,
+        )
 
     processed: set[Path] = set()
     renamed = 0
@@ -914,7 +933,7 @@ def deep_unzip(
 
             print(f"[APPLY] extract {current} ({kind}) -> {extract_dir}")
             try:
-                extract_archive_to_dir(current, kind, extract_dir, passwords, extractor)
+                extract_archive_to_dir(current, kind, extract_dir, passwords, extractor, prefer_7z_for_zip)
             except ArchivePasswordError as exc:
                 print(f"[SKIP] {current}: {exc}")
                 failed += 1
@@ -1102,6 +1121,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="path or command name for 7z/7zz/7za, required for RAR and 7Z extraction",
     )
     deep_unzip_parser.add_argument(
+        "--prefer-7z",
+        action="store_true",
+        help="extract ZIP archives with 7z/7zz/7za when available for better compatibility",
+    )
+    deep_unzip_parser.add_argument(
         "--force-extension",
         action="append",
         default=[],
@@ -1164,6 +1188,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.delete_archives,
                 args.extractor,
                 forced_extensions,
+                args.prefer_7z,
             )
 
         if args.command == "clean-empty-dirs":
