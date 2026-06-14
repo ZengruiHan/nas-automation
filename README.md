@@ -24,7 +24,7 @@ python3 nas_file_manager.py deep-extract /Volumes/NAS
 ```
 
 Fix missing or wrong archive suffixes and recursively extract nested ZIP, RAR,
-and 7Z files:
+7Z, and TAR files:
 
 ```bash
 python3 nas_file_manager.py deep-extract /Volumes/NAS --apply
@@ -37,7 +37,7 @@ extraction:
 python3 nas_file_manager.py deep-extract /Volumes/NAS --apply --delete-archives
 ```
 
-Try passwords while extracting encrypted ZIP files:
+Try passwords while extracting encrypted archives:
 
 ```bash
 python3 nas_file_manager.py deep-extract /Volumes/NAS --apply --delete-archives --password-file passwords.txt
@@ -86,13 +86,14 @@ and can export a CSV so you can review before deciding what to remove.
 ## Deep Archive Extraction
 
 The `deep-extract` command scans every file under a root and identifies ZIP,
-RAR, and 7Z archives by content, not by filename. This catches archives with no
-extension or with the wrong extension. `deep-unzip` remains available as a
-backward-compatible alias.
+RAR, 7Z, TAR, TAR.GZ/TGZ, TAR.BZ2/TBZ2, and TAR.XZ/TXZ archives by content, not
+by filename. This catches archives with no extension or with the wrong
+extension. `deep-unzip` remains available as a backward-compatible alias.
 
 For each supported archive, it will:
 
-- Rename the file to `.zip`, `.rar`, or `.7z` when the suffix is missing or wrong.
+- Rename the file to `.zip`, `.rar`, `.7z`, `.tar`, `.tar.gz`, `.tar.bz2`, or
+  `.tar.xz` when the suffix is missing or wrong.
 - Extract it into a sibling folder with the same base name.
 - Scan the extracted contents again, repeating until no more supported archives
   are found or `--max-depth` is reached.
@@ -114,9 +115,9 @@ python3 nas_file_manager.py deep-extract /Volumes/NAS --apply --ask-password
 ```
 
 Password files use one password per line. Blank lines and lines starting with
-`#` are ignored. ZIP files can be extracted with Python's standard library. RAR
-and 7Z files require `7zz`, `7z`, or `7za` on `PATH`, or a path supplied with
-`--extractor`.
+`#` are ignored. ZIP and TAR files can be extracted with Python's standard
+library. RAR and 7Z files require `7zz`, `7z`, or `7za` on `PATH`, or a path
+supplied with `--extractor`.
 
 Example with an explicit extractor:
 

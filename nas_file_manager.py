@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import zipfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -32,6 +33,19 @@ ARCHIVE_SUFFIXES = {
     "zip": ".zip",
     "rar": ".rar",
     "7z": ".7z",
+    "tar": ".tar",
+    "tar_gz": ".tar.gz",
+    "tar_bz2": ".tar.bz2",
+    "tar_xz": ".tar.xz",
+}
+ARCHIVE_SUFFIX_ALIASES = {
+    "zip": (".zip",),
+    "rar": (".rar",),
+    "7z": (".7z",),
+    "tar": (".tar",),
+    "tar_gz": (".tar.gz", ".tgz"),
+    "tar_bz2": (".tar.bz2", ".tbz2", ".tbz"),
+    "tar_xz": (".tar.xz", ".txz"),
 }
 EXTERNAL_EXTRACTORS = ("7zz", "7z", "7za")
 
@@ -79,7 +93,7 @@ class ArchivePasswordError(ArchiveError):
 
 
 class ArchiveUnsupportedError(ArchiveError):
-    """Raised when a ZIP uses features unsupported by Python's zipfile module."""
+    """Raised when an archive uses features unsupported by available tools."""
 
 
 class ArchiveUnsafePathError(ArchiveError):
@@ -421,7 +435,7 @@ def find_duplicates(root: Path, min_size_mb: float, export_csv: Path | None, inc
 def archive_type(path: Path) -> str | None:
     try:
         with path.open("rb") as handle:
-            header = handle.read(8)
+            header = handle.read(512)
     except OSError:
         return None
 
@@ -429,11 +443,20 @@ def archive_type(path: Path) -> str | None:
         return "7z"
     if header.startswith(b"Rar!\x1a\x07\x00") or header.startswith(b"Rar!\x1a\x07\x01\x00"):
         return "rar"
-    try:
-        if zipfile.is_zipfile(path):
-            return "zip"
-    except OSError:
-        return None
+    if header.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
+        try:
+            if zipfile.is_zipfile(path):
+                return "zip"
+        except OSError:
+            return None
+    if is_tar_archive(path):
+        if header.startswith(b"\x1f\x8b"):
+            return "tar_gz"
+        if header.startswith(b"BZh"):
+            return "tar_bz2"
+        if header.startswith(b"\xfd7zXZ\x00"):
+            return "tar_xz"
+        return "tar"
     return None
 
 
@@ -450,7 +473,7 @@ def is_zip_archive(path: Path) -> bool:
 
 def corrected_archive_path(path: Path, kind: str) -> Path:
     suffix = ARCHIVE_SUFFIXES[kind]
-    if path.suffix.lower() == suffix:
+    if has_archive_suffix(path, kind):
         return path
     if path.suffix:
         return path.with_suffix(suffix)
@@ -458,7 +481,24 @@ def corrected_archive_path(path: Path, kind: str) -> Path:
 
 
 def default_extract_dir(path: Path) -> Path:
+    lower_name = path.name.lower()
+    for suffixes in ARCHIVE_SUFFIX_ALIASES.values():
+        for suffix in sorted(suffixes, key=len, reverse=True):
+            if lower_name.endswith(suffix):
+                return path.with_name(path.name[: -len(suffix)])
     return path.with_suffix("")
+
+
+def has_archive_suffix(path: Path, kind: str) -> bool:
+    lower_name = path.name.lower()
+    return any(lower_name.endswith(suffix) for suffix in ARCHIVE_SUFFIX_ALIASES[kind])
+
+
+def is_tar_archive(path: Path) -> bool:
+    try:
+        return path.is_file() and tarfile.is_tarfile(path)
+    except (OSError, tarfile.TarError):
+        return False
 
 
 def safe_zip_member_path(info: zipfile.ZipInfo) -> Path:
@@ -519,6 +559,49 @@ def extract_zip_to_dir(zip_path: Path, extract_dir: Path, passwords: list[str]) 
 
     detail = "; ".join(password_errors) if password_errors else "password did not work"
     raise ArchivePasswordError(detail)
+
+
+def safe_tar_member_path(info: tarfile.TarInfo) -> Path:
+    raw_name = info.name.replace("\\", "/")
+    member = PurePosixPath(raw_name)
+    if raw_name.startswith("/") or member.is_absolute() or ".." in member.parts:
+        raise ArchiveUnsafePathError(f"unsafe member path {info.name!r}")
+    if info.issym() or info.islnk():
+        raise ArchiveUnsafePathError(f"refusing link member {info.name!r}")
+    if not member.parts:
+        raise ArchiveUnsafePathError(f"empty member path {info.name!r}")
+    return Path(*member.parts)
+
+
+def extract_tar_to_dir(tar_path: Path, extract_dir: Path) -> None:
+    staging = unique_destination(extract_dir.with_name(extract_dir.name + ".__extracting__"))
+    staging.mkdir(parents=True, exist_ok=False)
+    try:
+        with tarfile.open(tar_path, mode="r:*") as archive:
+            for info in archive:
+                relative = safe_tar_member_path(info)
+                target = staging / relative
+                if info.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    apply_tar_mtime(target, info)
+                    continue
+                if not info.isfile():
+                    continue
+
+                source = archive.extractfile(info)
+                if source is None:
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists():
+                    target = unique_destination(target)
+                with source, target.open("wb") as destination:
+                    shutil.copyfileobj(source, destination)
+                apply_tar_mtime(target, info)
+
+        staging.rename(extract_dir)
+    except (OSError, tarfile.TarError, ArchiveUnsafePathError) as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise ArchiveError(str(exc)) from exc
 
 
 def find_external_extractor(extractor: str | None = None) -> str | None:
@@ -603,6 +686,10 @@ def extract_archive_to_dir(
     passwords: list[str],
     extractor: str | None,
 ) -> None:
+    if archive_kind.startswith("tar"):
+        extract_tar_to_dir(archive_path, extract_dir)
+        return
+
     if archive_kind == "zip":
         try:
             extract_zip_to_dir(archive_path, extract_dir, passwords)
@@ -623,6 +710,13 @@ def apply_zip_mtime(target: Path, info: zipfile.ZipInfo) -> None:
     try:
         os.utime(target, (mtime, mtime))
     except OSError:
+        pass
+
+
+def apply_tar_mtime(target: Path, info: tarfile.TarInfo) -> None:
+    try:
+        os.utime(target, (info.mtime, info.mtime))
+    except (OSError, ValueError):
         pass
 
 
@@ -843,7 +937,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     deep_unzip_parser = subparsers.add_parser(
         "deep-unzip",
         aliases=["deep-extract"],
-        help="fix archive suffixes and recursively extract nested ZIP/RAR/7Z archives",
+        help="fix archive suffixes and recursively extract nested ZIP/RAR/7Z/TAR archives",
     )
     deep_unzip_parser.add_argument("root", help="folder to scan")
     deep_unzip_parser.add_argument("--apply", action="store_true", help="actually rename and extract archives")
