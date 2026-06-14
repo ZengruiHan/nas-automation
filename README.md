@@ -122,7 +122,9 @@ RAR, 7Z, TAR, TAR.GZ/TGZ, TAR.BZ2/TBZ2, and TAR.XZ/TXZ archives by content, not
 by filename. This catches archives with no extension or with the wrong
 extension. `deep-unzip` remains available as a backward-compatible alias.
 It also recognizes split archive first volumes such as `.7z.001`, `.zip.001`,
-`.rar.001`, `.part1.rar`, and `.part01.rar`.
+`.rar.001`, `.part1.rar`, and `.part01.rar`. It also handles sets where the
+first volume is named like a normal archive, such as `.7z`, followed by
+`.7z.002`, `.7z.003`, and so on.
 
 For each supported archive, it will:
 
@@ -130,6 +132,9 @@ For each supported archive, it will:
   `.tar.xz` when the suffix is missing or wrong.
 - Keep split archive names unchanged, extract only the first volume, and skip
   follower volumes such as `.002`, `.003`, `.r00`, and `.z01`.
+- When only a follower volume such as `.7z.002` is present, print a warning for
+  the missing first volume, such as `.7z.001` or `.7z`. Follower volumes cannot be
+  extracted on their own.
 - Extract it into a sibling folder with the same base name.
 - Scan the extracted contents again, repeating until no more supported archives
   are found or `--max-depth` is reached.

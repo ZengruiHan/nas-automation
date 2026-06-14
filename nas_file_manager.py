@@ -558,6 +558,9 @@ def same_split_archive_group(left: SplitArchiveInfo, right: SplitArchiveInfo) ->
 def split_archive_volumes(path: Path) -> tuple[Path, ...]:
     info = split_archive_info(path)
     if not info or not info.is_first_volume:
+        followers = numbered_split_followers_for_base(path)
+        if followers:
+            return (path, *followers)
         return (path,)
 
     try:
@@ -575,6 +578,37 @@ def split_archive_volumes(path: Path) -> tuple[Path, ...]:
 
     volumes.sort()
     return tuple(volume for _part_number, _name, volume in volumes) or (path,)
+
+
+def numbered_split_followers_for_base(path: Path) -> tuple[Path, ...]:
+    suffix = path.suffix.lower()
+    if suffix not in {".zip", ".rar", ".7z"}:
+        return ()
+
+    stem = path.with_suffix("").name.casefold()
+    kind = suffix.lstrip(".")
+
+    try:
+        siblings = list(path.parent.iterdir())
+    except OSError:
+        return ()
+
+    followers: list[tuple[int, str, Path]] = []
+    for sibling in siblings:
+        if not sibling.is_file():
+            continue
+        sibling_info = split_archive_info(sibling)
+        if (
+            sibling_info
+            and sibling_info.family == "numbered"
+            and sibling_info.kind == kind
+            and sibling_info.stem.casefold() == stem
+            and sibling_info.part_number > 1
+        ):
+            followers.append((sibling_info.part_number, sibling.name.casefold(), sibling))
+
+    followers.sort()
+    return tuple(follower for _part_number, _name, follower in followers)
 
 
 def old_style_split_companions(path: Path) -> tuple[Path, ...]:
@@ -618,7 +652,35 @@ def archive_delete_targets(path: Path) -> tuple[Path, ...]:
 
 
 def archive_uses_split_volumes(path: Path) -> bool:
-    return split_archive_info(path) is not None or bool(old_style_split_companions(path))
+    return (
+        split_archive_info(path) is not None
+        or bool(numbered_split_followers_for_base(path))
+        or bool(old_style_split_companions(path))
+    )
+
+
+def first_split_volume_path(path: Path) -> Path | None:
+    info = split_archive_info(path)
+    if not info or info.is_first_volume:
+        return None
+
+    if info.family == "numbered":
+        first_part = f"{1:0{info.part_width}d}"
+        standard_first = path.with_name(f"{info.stem}.{info.kind}.{first_part}")
+        if standard_first.exists():
+            return standard_first
+        base_first = path.with_name(f"{info.stem}.{info.kind}")
+        if base_first.exists():
+            return base_first
+        return standard_first
+    if info.family == "rar_part":
+        first_part = f"{1:0{info.part_width}d}"
+        return path.with_name(f"{info.stem}.part{first_part}.rar")
+    if info.family == "rar_old":
+        return path.with_name(f"{info.stem}.rar")
+    if info.family == "zip_old":
+        return path.with_name(f"{info.stem}.zip")
+    return None
 
 
 def archive_type(path: Path, forced_extensions: dict[str, str] | None = None) -> str | None:
@@ -1147,11 +1209,52 @@ def list_archive_candidates(
     forced_extensions: dict[str, str] | None = None,
 ) -> list[tuple[Path, str]]:
     candidates: list[tuple[Path, str]] = []
+    seen: set[Path] = set()
     for path in iter_files(root, recursive=True, include_symlinks=include_symlinks):
+        candidate_path = path
         kind = archive_type(path, forced_extensions)
+        if not kind:
+            first_volume = first_split_volume_path(path)
+            if first_volume and first_volume.exists():
+                candidate_path = first_volume
+                kind = archive_type(first_volume, forced_extensions)
         if kind:
-            candidates.append((path, kind))
+            resolved = candidate_path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            candidates.append((candidate_path, kind))
     return candidates
+
+
+def missing_split_first_volumes(root: Path, include_symlinks: bool) -> list[tuple[Path, Path]]:
+    missing: list[tuple[Path, Path]] = []
+    seen_expected: set[Path] = set()
+    for path in iter_files(root, recursive=True, include_symlinks=include_symlinks):
+        first_volume = first_split_volume_path(path)
+        if not first_volume or first_volume.exists():
+            continue
+        resolved = first_volume.resolve()
+        if resolved in seen_expected:
+            continue
+        seen_expected.add(resolved)
+        missing.append((path, first_volume))
+    return missing
+
+
+def print_missing_split_first_volume_warnings(root: Path, include_symlinks: bool) -> int:
+    missing = missing_split_first_volumes(root, include_symlinks)
+    if not missing:
+        return 0
+
+    print("\nWarning: found split archive follower volumes without their first volume.")
+    print("Split archives must be extracted from the first volume, for example .7z.001 or .7z.")
+    for follower, expected in missing[:20]:
+        print(f"  follower: {follower}")
+        print(f"  missing:  {expected}")
+    if len(missing) > 20:
+        print(f"  ... {len(missing) - 20} more missing first volume(s)")
+    return len(missing)
 
 
 def list_zip_candidates(root: Path, include_symlinks: bool) -> list[Path]:
@@ -1175,6 +1278,7 @@ def preview_deep_unzip(
     candidates = list_archive_candidates(root, include_symlinks, forced_extensions)
     if not candidates:
         print(f"No supported archives found under {root}")
+        print_missing_split_first_volume_warnings(root, include_symlinks)
         return 0
 
     external_extractor = find_external_extractor(extractor)
@@ -1191,6 +1295,7 @@ def preview_deep_unzip(
         print(f"ZIP filename encodings will be tried first: {', '.join(zip_name_encodings)}")
     else:
         print(f"Japanese ZIP filename auto-detection is enabled: {', '.join(DEFAULT_ZIP_NAME_ENCODINGS)}")
+    print_missing_split_first_volume_warnings(root, include_symlinks)
 
     print(f"Found {len(candidates)} supported archive(s) under {root}")
     for path, kind in candidates:
@@ -1273,6 +1378,7 @@ def deep_unzip(
         ]
         if not candidates:
             print("\nNo more supported archives found.")
+            print_missing_split_first_volume_warnings(root, include_symlinks)
             break
 
         print(f"\nPass {depth}: {len(candidates)} supported archive(s)")
