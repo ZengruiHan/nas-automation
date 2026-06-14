@@ -1,0 +1,58 @@
+{
+  "roots": {
+    "incoming": "~/Downloads",
+    "photos": "/Volumes/NAS/Photos",
+    "videos": "/Volumes/NAS/Videos",
+    "documents": "/Volumes/NAS/Documents",
+    "archives": "/Volumes/NAS/Archives"
+  },
+  "ignore_files": [
+    ".DS_Store",
+    "Thumbs.db",
+    "*.tmp",
+    "*.part"
+  ],
+  "ignore_dirs": [
+    ".git",
+    "__pycache__",
+    "@eaDir",
+    "#recycle",
+    ".Trash",
+    ".Trashes"
+  ],
+  "organize": [
+    {
+      "name": "photos by month",
+      "source": "incoming",
+      "target": "photos/{year}/{month}",
+      "extensions": [".jpg", ".jpeg", ".png", ".heic", ".gif", ".tif", ".tiff", ".raw"],
+      "rename_template": "{name}",
+      "recursive": true
+    },
+    {
+      "name": "videos by month",
+      "source": "incoming",
+      "target": "videos/{year}/{month}",
+      "extensions": [".mp4", ".mov", ".mkv", ".avi", ".m4v"],
+      "rename_template": "{name}",
+      "recursive": true
+    },
+    {
+      "name": "documents by type",
+      "source": "incoming",
+      "target": "documents/{ext}",
+      "extensions": [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".md"],
+      "rename_template": "{name}",
+      "recursive": true
+    },
+    {
+      "name": "old archives",
+      "source": "incoming",
+      "target": "archives/{year}",
+      "extensions": [".zip", ".tar", ".gz", ".7z", ".rar"],
+      "older_than_days": 30,
+      "rename_template": "{name}",
+      "recursive": true
+    }
+  ]
+}
