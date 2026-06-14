@@ -124,7 +124,9 @@ extension. `deep-unzip` remains available as a backward-compatible alias.
 It also recognizes split archive first volumes such as `.7z.001`, `.zip.001`,
 `.rar.001`, `.part1.rar`, and `.part01.rar`. It also handles sets where the
 first volume is named like a normal archive, such as `.7z`, followed by
-`.7z.002`, `.7z.003`, and so on.
+`.7z.002`, `.7z.003`, and so on. For those alternate numbered sets, the script
+creates temporary `.001` aliases for 7-Zip so the original files do not need to
+be renamed before extraction.
 
 For each supported archive, it will:
 

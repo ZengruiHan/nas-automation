@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import zipfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -611,6 +612,38 @@ def numbered_split_followers_for_base(path: Path) -> tuple[Path, ...]:
     return tuple(follower for _part_number, _name, follower in followers)
 
 
+def prepare_numbered_split_aliases_for_base(path: Path) -> tuple[Path, tempfile.TemporaryDirectory[str] | None]:
+    followers = numbered_split_followers_for_base(path)
+    if not followers:
+        return path, None
+
+    kind = path.suffix.lower().lstrip(".")
+    stem = path.with_suffix("").name
+    temp_dir = tempfile.TemporaryDirectory(prefix=f"{path.name}.__split_input__.", dir=str(path.parent))
+    alias_dir = Path(temp_dir.name)
+
+    try:
+        create_file_alias(path, alias_dir / f"{stem}.{kind}.001")
+        for follower in followers:
+            follower_info = split_archive_info(follower)
+            if not follower_info:
+                continue
+            part = f"{follower_info.part_number:0{follower_info.part_width}d}"
+            create_file_alias(follower, alias_dir / f"{stem}.{kind}.{part}")
+    except OSError:
+        temp_dir.cleanup()
+        raise
+
+    return alias_dir / f"{stem}.{kind}.001", temp_dir
+
+
+def create_file_alias(source: Path, target: Path) -> None:
+    try:
+        target.symlink_to(source)
+    except OSError:
+        os.link(source, target)
+
+
 def old_style_split_companions(path: Path) -> tuple[Path, ...]:
     suffix = path.suffix.lower()
     if suffix not in {".rar", ".zip"}:
@@ -1014,40 +1047,49 @@ def extract_with_7z(
     candidates: list[str | None] = passwords if passwords else [None]
     errors: list[str] = []
 
-    for password in candidates:
-        staging = unique_destination(extract_dir.with_name(extract_dir.name + ".__extracting__"))
-        staging.mkdir(parents=True, exist_ok=False)
-        command = [
-            executable,
-            "x",
-            "-y",
-            "-bd",
-            "-bso0",
-            "-bsp0",
-            f"-o{staging}",
-        ]
-        if password is not None:
-            command.append(f"-p{password}")
-        command.append(str(archive_path))
+    try:
+        archive_for_extractor, split_aliases = prepare_numbered_split_aliases_for_base(archive_path)
+    except OSError as exc:
+        raise ArchiveError(f"could not prepare split archive aliases: {exc}") from exc
 
-        try:
-            result = subprocess.run(
-                command,
-                text=True,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=None,
-            )
-            if result.returncode == 0:
-                staging.rename(extract_dir)
-                return
-            errors.append(summarize_extractor_error(result.stderr or result.stdout))
-        except OSError as exc:
-            errors.append(str(exc))
-        finally:
-            if staging.exists():
-                shutil.rmtree(staging, ignore_errors=True)
+    try:
+        for password in candidates:
+            staging = unique_destination(extract_dir.with_name(extract_dir.name + ".__extracting__"))
+            staging.mkdir(parents=True, exist_ok=False)
+            command = [
+                executable,
+                "x",
+                "-y",
+                "-bd",
+                "-bso0",
+                "-bsp0",
+                f"-o{staging}",
+            ]
+            if password is not None:
+                command.append(f"-p{password}")
+            command.append(str(archive_for_extractor))
+
+            try:
+                result = subprocess.run(
+                    command,
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=None,
+                )
+                if result.returncode == 0:
+                    staging.rename(extract_dir)
+                    return
+                errors.append(summarize_extractor_error(result.stderr or result.stdout))
+            except OSError as exc:
+                errors.append(str(exc))
+            finally:
+                if staging.exists():
+                    shutil.rmtree(staging, ignore_errors=True)
+    finally:
+        if split_aliases:
+            split_aliases.cleanup()
 
     detail = "; ".join(error for error in errors if error) or "extractor failed"
     if "password" in detail.lower() or "wrong password" in detail.lower():
