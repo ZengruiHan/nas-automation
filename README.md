@@ -114,6 +114,16 @@ python3 nas_file_manager.py deep-extract /Volumes/NAS --apply --password-file pa
 python3 nas_file_manager.py deep-extract /Volumes/NAS --apply --ask-password
 ```
 
+If files are deliberately mislabeled with a non-archive extension, force that
+extension to be treated as an archive type:
+
+```bash
+python3 nas_file_manager.py deep-extract /Volumes/NAS --apply --delete-archives --force-extension .mp4=zip
+```
+
+Use forced extensions only when you are sure those files are disguised
+archives. A real video file forced as ZIP will fail to extract.
+
 Password files use one password per line. Blank lines and lines starting with
 `#` are ignored. ZIP and TAR files can be extracted with Python's standard
 library. RAR and 7Z files require `7zz`, `7z`, or `7za` on `PATH`, or a path

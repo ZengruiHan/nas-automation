@@ -432,7 +432,7 @@ def find_duplicates(root: Path, min_size_mb: float, export_csv: Path | None, inc
     return 0
 
 
-def archive_type(path: Path) -> str | None:
+def archive_type(path: Path, forced_extensions: dict[str, str] | None = None) -> str | None:
     try:
         with path.open("rb") as handle:
             header = handle.read(512)
@@ -457,6 +457,8 @@ def archive_type(path: Path) -> str | None:
         if header.startswith(b"\xfd7zXZ\x00"):
             return "tar_xz"
         return "tar"
+    if forced_extensions:
+        return forced_extensions.get(path.suffix.lower())
     return None
 
 
@@ -750,10 +752,33 @@ def dedupe_preserve_order(values: Iterable[str]) -> list[str]:
     return result
 
 
-def list_archive_candidates(root: Path, include_symlinks: bool) -> list[tuple[Path, str]]:
+def parse_forced_extensions(values: list[str]) -> dict[str, str]:
+    forced: dict[str, str] = {}
+    for value in values:
+        if "=" not in value:
+            raise ValueError(f"Invalid --force-extension value {value!r}; use .ext=archive_type")
+        raw_extension, raw_kind = value.split("=", 1)
+        extension = raw_extension.strip().lower()
+        kind = raw_kind.strip().lower().replace("-", "_")
+        if not extension:
+            raise ValueError(f"Invalid --force-extension value {value!r}; extension is empty")
+        if not extension.startswith("."):
+            extension = "." + extension
+        if kind not in ARCHIVE_SUFFIXES:
+            supported = ", ".join(sorted(ARCHIVE_SUFFIXES))
+            raise ValueError(f"Unsupported archive type {kind!r}; supported types: {supported}")
+        forced[extension] = kind
+    return forced
+
+
+def list_archive_candidates(
+    root: Path,
+    include_symlinks: bool,
+    forced_extensions: dict[str, str] | None = None,
+) -> list[tuple[Path, str]]:
     candidates: list[tuple[Path, str]] = []
     for path in iter_files(root, recursive=True, include_symlinks=include_symlinks):
-        kind = archive_type(path)
+        kind = archive_type(path, forced_extensions)
         if kind:
             candidates.append((path, kind))
     return candidates
@@ -772,8 +797,9 @@ def preview_deep_unzip(
     include_symlinks: bool,
     delete_archives: bool,
     extractor: str | None,
+    forced_extensions: dict[str, str] | None,
 ) -> int:
-    candidates = list_archive_candidates(root, include_symlinks)
+    candidates = list_archive_candidates(root, include_symlinks, forced_extensions)
     if not candidates:
         print(f"No supported archives found under {root}")
         return 0
@@ -812,13 +838,14 @@ def deep_unzip(
     include_symlinks: bool,
     delete_archives: bool,
     extractor: str | None,
+    forced_extensions: dict[str, str] | None,
 ) -> int:
     if not root.exists():
         raise FileNotFoundError(root)
     if max_depth < 1:
         raise ValueError("--max-depth must be at least 1")
     if not apply:
-        return preview_deep_unzip(root, include_symlinks, delete_archives, extractor)
+        return preview_deep_unzip(root, include_symlinks, delete_archives, extractor, forced_extensions)
 
     processed: set[Path] = set()
     renamed = 0
@@ -830,7 +857,7 @@ def deep_unzip(
     for depth in range(1, max_depth + 1):
         candidates = [
             (path, kind)
-            for path, kind in list_archive_candidates(root, include_symlinks)
+            for path, kind in list_archive_candidates(root, include_symlinks, forced_extensions)
             if path.resolve() not in processed
         ]
         if not candidates:
@@ -952,6 +979,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="path or command name for 7z/7zz/7za, required for RAR and 7Z extraction",
     )
     deep_unzip_parser.add_argument(
+        "--force-extension",
+        action="append",
+        default=[],
+        metavar="EXT=TYPE",
+        help="treat files with an extension as an archive type, e.g. .mp4=zip; can be repeated",
+    )
+    deep_unzip_parser.add_argument(
         "--password",
         action="append",
         default=[],
@@ -994,6 +1028,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command in {"deep-unzip", "deep-extract"}:
             passwords = load_passwords(args.password, args.password_file, args.ask_password)
+            forced_extensions = parse_forced_extensions(args.force_extension)
             return deep_unzip(
                 expand_path(args.root),
                 passwords,
@@ -1002,6 +1037,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.include_symlinks,
                 args.delete_archives,
                 args.extractor,
+                forced_extensions,
             )
 
         if args.command == "clean-empty-dirs":
