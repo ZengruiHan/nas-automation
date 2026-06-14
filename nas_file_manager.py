@@ -48,6 +48,30 @@ ARCHIVE_SUFFIX_ALIASES = {
     "tar_xz": (".tar.xz", ".txz"),
 }
 EXTERNAL_EXTRACTORS = ("7zz", "7z", "7za")
+VIDEO_EXTENSIONS = {
+    ".3g2",
+    ".3gp",
+    ".asf",
+    ".avi",
+    ".divx",
+    ".f4v",
+    ".flv",
+    ".m2ts",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".mpeg",
+    ".mpg",
+    ".mts",
+    ".ogv",
+    ".rm",
+    ".rmvb",
+    ".ts",
+    ".vob",
+    ".webm",
+    ".wmv",
+}
 
 
 @dataclass(frozen=True)
@@ -945,6 +969,95 @@ def plan_clean_empty_dirs(root: Path) -> list[Operation]:
     return operations
 
 
+def is_video_file(path: Path, video_extensions: set[str] = VIDEO_EXTENSIONS) -> bool:
+    return path.suffix.lower() in video_extensions
+
+
+def plan_flatten_videos(root: Path, include_symlinks: bool = False) -> tuple[list[Operation], list[Operation]]:
+    if not root.exists():
+        return [Operation("skip", root, None, "root missing")], []
+    if not root.is_dir():
+        raise ValueError(f"{root} is not a directory")
+
+    root = root.resolve()
+    move_operations: list[Operation] = []
+    reserved_targets: set[Path] = set()
+
+    for path in iter_files(root, recursive=True, include_symlinks=include_symlinks):
+        if not is_video_file(path):
+            continue
+        if path.parent.resolve() == root:
+            continue
+
+        target = unique_destination_with_reserved(root / path.name, reserved_targets)
+        reserved_targets.add(target.resolve())
+        move_operations.append(Operation("move", path, target, "flatten video"))
+
+    empty_dir_operations = plan_empty_dirs_after_moves(root, move_operations)
+    return move_operations, empty_dir_operations
+
+
+def unique_destination_with_reserved(target: Path, reserved_targets: set[Path]) -> Path:
+    candidate = target
+    if not candidate.exists() and candidate.resolve() not in reserved_targets:
+        return candidate
+
+    stem = target.stem
+    suffix = target.suffix
+    parent = target.parent
+    for index in range(1, 10_000):
+        candidate = parent / f"{stem} ({index}){suffix}"
+        if not candidate.exists() and candidate.resolve() not in reserved_targets:
+            return candidate
+    raise RuntimeError(f"Could not find a free destination for {target}")
+
+
+def plan_empty_dirs_after_moves(root: Path, move_operations: list[Operation]) -> list[Operation]:
+    moved_sources = {op.source.resolve() for op in move_operations if op.source}
+    planned_empty: set[Path] = set()
+    operations: list[Operation] = []
+
+    for dirpath, _dirnames, _filenames in os.walk(root, topdown=False):
+        path = Path(dirpath)
+        if path == root:
+            continue
+
+        try:
+            children = list(path.iterdir())
+        except OSError:
+            continue
+
+        has_remaining_child = False
+        for child in children:
+            resolved_child = child.resolve()
+            if resolved_child in moved_sources:
+                continue
+            if child.is_dir() and resolved_child in planned_empty:
+                continue
+            has_remaining_child = True
+            break
+
+        if has_remaining_child:
+            continue
+        planned_empty.add(path.resolve())
+        operations.append(Operation("remove-empty-dir", path, None, "empty after moving videos"))
+
+    return operations
+
+
+def flatten_videos(root: Path, apply: bool, include_symlinks: bool) -> int:
+    move_operations, empty_dir_operations = plan_flatten_videos(root, include_symlinks)
+    move_count = apply_operations(move_operations, apply=apply)
+    empty_count = apply_operations(empty_dir_operations, apply=apply)
+
+    print("\nSummary:")
+    print(f"  Videos moved:       {move_count}")
+    print(f"  Empty dirs removed: {empty_count}")
+    if not apply:
+        print("No files changed. Re-run with --apply to execute.")
+    return 0
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Safe NAS file automation helper")
     parser.add_argument("--include-symlinks", action="store_true", help="include symlinked files/directories")
@@ -963,6 +1076,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     duplicates_parser.add_argument("root", help="folder to scan")
     duplicates_parser.add_argument("--min-size-mb", type=float, default=1.0, help="skip files smaller than this")
     duplicates_parser.add_argument("--export-csv", help="optional CSV output path")
+
+    flatten_videos_parser = subparsers.add_parser(
+        "flatten-videos",
+        help="move videos from subfolders to the root and remove emptied folders",
+    )
+    flatten_videos_parser.add_argument("root", help="folder whose top level should receive videos")
+    flatten_videos_parser.add_argument("--apply", action="store_true", help="actually move videos and remove folders")
 
     deep_unzip_parser = subparsers.add_parser(
         "deep-unzip",
@@ -1028,6 +1148,9 @@ def main(argv: list[str] | None = None) -> int:
                 export_csv,
                 args.include_symlinks,
             )
+
+        if args.command == "flatten-videos":
+            return flatten_videos(expand_path(args.root), args.apply, args.include_symlinks)
 
         if args.command in {"deep-unzip", "deep-extract"}:
             passwords = load_passwords(args.password, args.password_file, args.ask_password)

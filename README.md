@@ -43,6 +43,18 @@ Try passwords while extracting encrypted archives:
 python3 nas_file_manager.py deep-extract /Volumes/NAS --apply --delete-archives --password-file passwords.txt
 ```
 
+Preview moving videos from nested folders to the top level:
+
+```bash
+python3 nas_file_manager.py flatten-videos /Volumes/NAS
+```
+
+Move videos to the top level and remove emptied folders:
+
+```bash
+python3 nas_file_manager.py flatten-videos /Volumes/NAS --apply
+```
+
 Preview rule-based organization:
 
 ```bash
@@ -82,6 +94,26 @@ Edit `nas_rules.example.json` or copy it to your own config file. A rule has:
 
 The script never deletes duplicate files. The `duplicates` command reports them
 and can export a CSV so you can review before deciding what to remove.
+
+## Flatten Videos
+
+The `flatten-videos` command scans a root folder recursively and moves common
+video files from nested folders into the root folder itself. It then removes
+folders that became empty after the move.
+
+Common video extensions include `.mp4`, `.mkv`, `.mov`, `.avi`, `.wmv`, `.flv`,
+`.webm`, `.m4v`, `.mpg`, `.mpeg`, `.3gp`, `.ts`, `.mts`, `.m2ts`, `.vob`,
+`.ogv`, `.rm`, `.rmvb`, `.asf`, `.divx`, and `.f4v`.
+
+If a file with the same name already exists in the root, the moved file gets a
+numbered suffix such as `movie (1).mp4`.
+
+Examples:
+
+```bash
+python3 nas_file_manager.py flatten-videos /Volumes/NAS
+python3 nas_file_manager.py flatten-videos /Volumes/NAS --apply
+```
 
 ## Deep Archive Extraction
 
