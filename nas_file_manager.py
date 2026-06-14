@@ -7,6 +7,7 @@ The script defaults to dry-run mode. Add --apply to commands that change files.
 from __future__ import annotations
 
 import argparse
+import codecs
 import csv
 import fnmatch
 import getpass
@@ -49,6 +50,17 @@ ARCHIVE_SUFFIX_ALIASES = {
     "tar_xz": (".tar.xz", ".txz"),
 }
 EXTERNAL_EXTRACTORS = ("7zz", "7z", "7za")
+DEFAULT_ZIP_NAME_ENCODINGS = ("cp932", "shift_jis")
+ZIP_UTF8_FLAG = 0x800
+MOJIBAKE_CHARS = frozenset(
+    "¡¢£¤¥¦§¨©ª«¬®¯°±²³´µ¶·¸¹º»¼½¾¿"
+    "ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞß"
+    "àáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ"
+    "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ"
+    "¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»"
+    "░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬"
+    "╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀�"
+)
 NUMBERED_SPLIT_ARCHIVE_RE = re.compile(
     r"^(?P<stem>.+)\.(?P<kind>zip|rar|7z)\.(?P<part>\d{3,})$",
     re.IGNORECASE,
@@ -710,6 +722,95 @@ def is_tar_archive(path: Path) -> bool:
         return False
 
 
+def open_zip_file(zip_path: Path, metadata_encoding: str | None = None) -> zipfile.ZipFile:
+    if metadata_encoding:
+        return zipfile.ZipFile(zip_path, metadata_encoding=metadata_encoding)
+    return zipfile.ZipFile(zip_path)
+
+
+def select_zip_name_encoding(zip_path: Path, requested_encodings: list[str]) -> str | None:
+    if requested_encodings:
+        for encoding in requested_encodings:
+            try:
+                with open_zip_file(zip_path, encoding) as archive:
+                    archive.infolist()
+                return encoding
+            except (LookupError, UnicodeDecodeError, zipfile.BadZipFile):
+                continue
+        raise ArchiveError(f"none of the requested ZIP name encodings worked: {', '.join(requested_encodings)}")
+
+    try:
+        with open_zip_file(zip_path) as archive:
+            default_infos = archive.infolist()
+    except zipfile.BadZipFile as exc:
+        raise ArchiveError(f"not a valid ZIP archive: {exc}") from exc
+
+    if not any(not info.flag_bits & ZIP_UTF8_FLAG for info in default_infos):
+        return None
+
+    default_names = [info.filename for info in default_infos]
+    default_score = zip_name_mojibake_score(default_names)
+    best_encoding: str | None = None
+    best_score = default_score
+    best_names: list[str] = default_names
+
+    for encoding in DEFAULT_ZIP_NAME_ENCODINGS:
+        try:
+            with open_zip_file(zip_path, encoding) as archive:
+                names = [info.filename for info in archive.infolist()]
+        except (LookupError, UnicodeDecodeError, zipfile.BadZipFile):
+            continue
+
+        score = zip_name_mojibake_score(names)
+        if score < best_score:
+            best_encoding = encoding
+            best_score = score
+            best_names = names
+
+    if best_encoding and default_score - best_score >= 6 and zip_names_have_japanese_text(best_names):
+        return best_encoding
+    return None
+
+
+def zip_name_mojibake_score(names: Iterable[str]) -> float:
+    score = 0.0
+    for name in names:
+        for char in name:
+            code = ord(char)
+            if char in MOJIBAKE_CHARS:
+                score += 4.0
+            elif code < 32:
+                score += 10.0
+            elif 0x0080 <= code <= 0x00FF:
+                score += 2.0
+            elif 0x2500 <= code <= 0x259F:
+                score += 5.0
+
+            if is_japanese_name_char(char):
+                score -= 2.0
+            elif is_cjk_unified_char(char):
+                score -= 0.25
+    return score
+
+
+def zip_names_have_japanese_text(names: Iterable[str]) -> bool:
+    return any(is_japanese_name_char(char) for name in names for char in name)
+
+
+def is_japanese_name_char(char: str) -> bool:
+    code = ord(char)
+    return (
+        0x3040 <= code <= 0x30FF
+        or 0x31F0 <= code <= 0x31FF
+        or 0xFF66 <= code <= 0xFF9F
+    )
+
+
+def is_cjk_unified_char(char: str) -> bool:
+    code = ord(char)
+    return 0x4E00 <= code <= 0x9FFF
+
+
 def safe_zip_member_path(info: zipfile.ZipInfo) -> Path:
     raw_name = info.filename.replace("\\", "/")
     member = PurePosixPath(raw_name)
@@ -718,9 +819,18 @@ def safe_zip_member_path(info: zipfile.ZipInfo) -> Path:
     return Path(*member.parts)
 
 
-def extract_zip_to_dir(zip_path: Path, extract_dir: Path, passwords: list[str]) -> None:
+def extract_zip_to_dir(
+    zip_path: Path,
+    extract_dir: Path,
+    passwords: list[str],
+    zip_name_encodings: list[str],
+) -> None:
+    metadata_encoding = select_zip_name_encoding(zip_path, zip_name_encodings)
+    if metadata_encoding:
+        print(f"[INFO] ZIP filename encoding: {metadata_encoding} for {zip_path}")
+
     try:
-        with zipfile.ZipFile(zip_path) as archive:
+        with open_zip_file(zip_path, metadata_encoding) as archive:
             infos = archive.infolist()
             for info in infos:
                 safe_zip_member_path(info)
@@ -738,7 +848,7 @@ def extract_zip_to_dir(zip_path: Path, extract_dir: Path, passwords: list[str]) 
         staging = unique_destination(extract_dir.with_name(extract_dir.name + ".__extracting__"))
         staging.mkdir(parents=True, exist_ok=False)
         try:
-            with zipfile.ZipFile(zip_path) as archive:
+            with open_zip_file(zip_path, metadata_encoding) as archive:
                 pwd = password.encode("utf-8") if password is not None else None
                 for info in archive.infolist():
                     relative = safe_zip_member_path(info)
@@ -897,6 +1007,7 @@ def extract_archive_to_dir(
     passwords: list[str],
     extractor: str | None,
     prefer_7z_for_zip: bool,
+    zip_name_encodings: list[str],
 ) -> None:
     if archive_kind.startswith("tar"):
         extract_tar_to_dir(archive_path, extract_dir)
@@ -906,7 +1017,17 @@ def extract_archive_to_dir(
     if archive_kind == "zip" and split_archive and not find_external_extractor(extractor):
         raise ArchiveUnsupportedError("split ZIP extraction requires 7zz, 7z, or 7za on PATH")
 
-    if archive_kind == "zip" and (split_archive or prefer_7z_for_zip) and find_external_extractor(extractor):
+    python_zip_tried = False
+    python_zip_error: ArchiveError | None = None
+    if archive_kind == "zip" and zip_name_encodings and not split_archive:
+        python_zip_tried = True
+        try:
+            extract_zip_to_dir(archive_path, extract_dir, passwords, zip_name_encodings)
+            return
+        except ArchiveError as exc:
+            python_zip_error = exc
+
+    if archive_kind == "zip" and (split_archive or prefer_7z_for_zip or python_zip_error) and find_external_extractor(extractor):
         try:
             extract_with_7z(archive_path, extract_dir, passwords, extractor)
             return
@@ -919,8 +1040,13 @@ def extract_archive_to_dir(
         raise seven_zip_error or ArchiveUnsupportedError("split ZIP extraction requires 7zz, 7z, or 7za on PATH")
 
     if archive_kind == "zip":
+        if python_zip_tried:
+            if seven_zip_error is not None and python_zip_error is not None:
+                raise ArchiveError(f"Python zip failed: {python_zip_error}; 7z failed: {seven_zip_error}") from seven_zip_error
+            if python_zip_error is not None:
+                raise python_zip_error
         try:
-            extract_zip_to_dir(archive_path, extract_dir, passwords)
+            extract_zip_to_dir(archive_path, extract_dir, passwords, zip_name_encodings)
             return
         except ArchiveUnsupportedError:
             if seven_zip_error is not None:
@@ -1001,6 +1127,20 @@ def parse_forced_extensions(values: list[str]) -> dict[str, str]:
     return forced
 
 
+def parse_zip_name_encodings(values: list[str]) -> list[str]:
+    encodings: list[str] = []
+    for value in values:
+        encoding = value.strip()
+        if not encoding:
+            raise ValueError("ZIP name encoding cannot be empty")
+        try:
+            codecs.lookup(encoding)
+        except LookupError as exc:
+            raise ValueError(f"Unknown ZIP name encoding {encoding!r}") from exc
+        encodings.append(encoding)
+    return dedupe_preserve_order(encodings)
+
+
 def list_archive_candidates(
     root: Path,
     include_symlinks: bool,
@@ -1029,6 +1169,7 @@ def preview_deep_unzip(
     extractor: str | None,
     forced_extensions: dict[str, str] | None,
     force_extensions_first_pass_only: bool,
+    zip_name_encodings: list[str],
     prefer_7z_for_zip: bool,
 ) -> int:
     candidates = list_archive_candidates(root, include_symlinks, forced_extensions)
@@ -1046,6 +1187,10 @@ def preview_deep_unzip(
             print("Warning: --prefer-7z was set, but 7zz/7z/7za was not found. ZIP extraction will use Python.")
     if forced_extensions and force_extensions_first_pass_only:
         print("Forced extensions will only be used during the first extraction pass.")
+    if zip_name_encodings:
+        print(f"ZIP filename encodings will be tried first: {', '.join(zip_name_encodings)}")
+    else:
+        print(f"Japanese ZIP filename auto-detection is enabled: {', '.join(DEFAULT_ZIP_NAME_ENCODINGS)}")
 
     print(f"Found {len(candidates)} supported archive(s) under {root}")
     for path, kind in candidates:
@@ -1089,6 +1234,7 @@ def deep_unzip(
     extractor: str | None,
     forced_extensions: dict[str, str] | None,
     force_extensions_first_pass_only: bool,
+    zip_name_encodings: list[str],
     prefer_7z_for_zip: bool,
 ) -> int:
     if not root.exists():
@@ -1103,6 +1249,7 @@ def deep_unzip(
             extractor,
             forced_extensions,
             force_extensions_first_pass_only,
+            zip_name_encodings,
             prefer_7z_for_zip,
         )
 
@@ -1155,7 +1302,15 @@ def deep_unzip(
 
             print(f"[APPLY] extract {current} ({kind}) -> {extract_dir}")
             try:
-                extract_archive_to_dir(current, kind, extract_dir, passwords, extractor, prefer_7z_for_zip)
+                extract_archive_to_dir(
+                    current,
+                    kind,
+                    extract_dir,
+                    passwords,
+                    extractor,
+                    prefer_7z_for_zip,
+                    zip_name_encodings,
+                )
             except ArchivePasswordError as exc:
                 print(f"[SKIP] {current}: {exc}")
                 failed += 1
@@ -1361,6 +1516,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="use --force-extension rules only during the first extraction pass",
     )
     deep_unzip_parser.add_argument(
+        "--zip-name-encoding",
+        action="append",
+        default=[],
+        metavar="ENCODING",
+        help="encoding for non-UTF-8 ZIP filenames, e.g. cp932 or shift_jis; can be repeated",
+    )
+    deep_unzip_parser.add_argument(
         "--password",
         action="append",
         default=[],
@@ -1407,6 +1569,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command in {"deep-unzip", "deep-extract"}:
             passwords = load_passwords(args.password, args.password_file, args.ask_password)
             forced_extensions = parse_forced_extensions(args.force_extension)
+            zip_name_encodings = parse_zip_name_encodings(args.zip_name_encoding)
             return deep_unzip(
                 expand_path(args.root),
                 passwords,
@@ -1417,6 +1580,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.extractor,
                 forced_extensions,
                 args.force_extension_first_pass_only,
+                zip_name_encodings,
                 args.prefer_7z,
             )
 

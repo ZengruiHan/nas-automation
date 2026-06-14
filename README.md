@@ -158,6 +158,16 @@ well. If `7z`, `7zz`, or `7za` is available, use it for ZIP files too:
 python3 nas_file_manager.py deep-extract /Volumes/NAS --apply --delete-archives --prefer-7z --password-file passwords.txt
 ```
 
+Old ZIP files created on Japanese Windows may store filenames as CP932/Shift-JIS
+instead of UTF-8. The Python ZIP extractor automatically tries common Japanese
+encodings when filenames look garbled. If a specific archive still extracts
+with mojibake, force the filename encoding:
+
+```bash
+python3 nas_file_manager.py deep-extract /Volumes/NAS --apply --delete-archives --zip-name-encoding cp932
+python3 nas_file_manager.py deep-extract /Volumes/NAS --apply --delete-archives --zip-name-encoding shift_jis
+```
+
 If files are deliberately mislabeled with a non-archive extension, force that
 extension to be treated as an archive type:
 
