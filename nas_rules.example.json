@@ -8,6 +8,7 @@
   },
   "ignore_files": [
     ".DS_Store",
+    "._*",
     "Thumbs.db",
     "*.tmp",
     "*.part"

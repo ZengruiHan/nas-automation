@@ -26,7 +26,7 @@ from string import Formatter
 from typing import Any, Iterable
 
 
-DEFAULT_IGNORE_FILES = {".DS_Store", "Thumbs.db"}
+DEFAULT_IGNORE_FILES = {".DS_Store", "Thumbs.db", "._*"}
 DEFAULT_IGNORE_DIRS = {".git", "__pycache__", "@eaDir", "#recycle", ".Trash", ".Trashes"}
 HASH_CHUNK_SIZE = 1024 * 1024
 ARCHIVE_SUFFIXES = {
@@ -512,11 +512,14 @@ def safe_zip_member_path(info: zipfile.ZipInfo) -> Path:
 
 
 def extract_zip_to_dir(zip_path: Path, extract_dir: Path, passwords: list[str]) -> None:
-    with zipfile.ZipFile(zip_path) as archive:
-        infos = archive.infolist()
-        for info in infos:
-            safe_zip_member_path(info)
-        encrypted = any(info.flag_bits & 0x1 for info in infos)
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            infos = archive.infolist()
+            for info in infos:
+                safe_zip_member_path(info)
+            encrypted = any(info.flag_bits & 0x1 for info in infos)
+    except zipfile.BadZipFile as exc:
+        raise ArchiveError(f"not a valid ZIP archive: {exc}") from exc
 
     if encrypted and not passwords:
         raise ArchivePasswordError("password required")
