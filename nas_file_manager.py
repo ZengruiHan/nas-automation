@@ -481,6 +481,9 @@ def archive_type(path: Path, forced_extensions: dict[str, str] | None = None) ->
         if header.startswith(b"\xfd7zXZ\x00"):
             return "tar_xz"
         return "tar"
+    suffix_kind = archive_type_from_suffix(path)
+    if suffix_kind:
+        return suffix_kind
     if forced_extensions:
         return forced_extensions.get(path.suffix.lower())
     return None
@@ -495,6 +498,19 @@ def is_zip_archive(path: Path) -> bool:
         return path.is_file() and zipfile.is_zipfile(path)
     except OSError:
         return False
+
+
+def archive_type_from_suffix(path: Path) -> str | None:
+    lower_name = path.name.lower()
+    ordered_aliases = sorted(
+        ARCHIVE_SUFFIX_ALIASES.items(),
+        key=lambda item: max(len(suffix) for suffix in item[1]),
+        reverse=True,
+    )
+    for kind, suffixes in ordered_aliases:
+        if any(lower_name.endswith(suffix) for suffix in suffixes):
+            return kind
+    return None
 
 
 def corrected_archive_path(path: Path, kind: str) -> Path:
@@ -656,7 +672,7 @@ def extract_with_7z(
     if not executable:
         raise ArchiveUnsupportedError("7z extraction requires 7zz, 7z, or 7za on PATH")
 
-    candidates: list[str | None] = [None] + passwords
+    candidates: list[str | None] = passwords if passwords else [None]
     errors: list[str] = []
 
     for password in candidates:
@@ -673,14 +689,13 @@ def extract_with_7z(
         ]
         if password is not None:
             command.append(f"-p{password}")
-        else:
-            command.append("-p")
         command.append(str(archive_path))
 
         try:
             result = subprocess.run(
                 command,
                 text=True,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 timeout=None,
@@ -721,16 +736,25 @@ def extract_archive_to_dir(
         return
 
     if archive_kind == "zip" and prefer_7z_for_zip and find_external_extractor(extractor):
-        extract_with_7z(archive_path, extract_dir, passwords, extractor)
-        return
+        try:
+            extract_with_7z(archive_path, extract_dir, passwords, extractor)
+            return
+        except ArchiveError as exc:
+            seven_zip_error = exc
+    else:
+        seven_zip_error = None
 
     if archive_kind == "zip":
         try:
             extract_zip_to_dir(archive_path, extract_dir, passwords)
             return
         except ArchiveUnsupportedError:
+            if seven_zip_error is not None:
+                raise ArchiveError(f"7z failed: {seven_zip_error}; Python zip unsupported") from seven_zip_error
             pass
-        except ArchiveError:
+        except ArchiveError as exc:
+            if seven_zip_error is not None:
+                raise ArchiveError(f"7z failed: {seven_zip_error}; Python zip failed: {exc}") from exc
             raise
 
     extract_with_7z(archive_path, extract_dir, passwords, extractor)
