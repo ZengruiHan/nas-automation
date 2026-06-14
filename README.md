@@ -121,17 +121,22 @@ The `deep-extract` command scans every file under a root and identifies ZIP,
 RAR, 7Z, TAR, TAR.GZ/TGZ, TAR.BZ2/TBZ2, and TAR.XZ/TXZ archives by content, not
 by filename. This catches archives with no extension or with the wrong
 extension. `deep-unzip` remains available as a backward-compatible alias.
+It also recognizes split archive first volumes such as `.7z.001`, `.zip.001`,
+`.rar.001`, `.part1.rar`, and `.part01.rar`.
 
 For each supported archive, it will:
 
 - Rename the file to `.zip`, `.rar`, `.7z`, `.tar`, `.tar.gz`, `.tar.bz2`, or
   `.tar.xz` when the suffix is missing or wrong.
+- Keep split archive names unchanged, extract only the first volume, and skip
+  follower volumes such as `.002`, `.003`, `.r00`, and `.z01`.
 - Extract it into a sibling folder with the same base name.
 - Scan the extracted contents again, repeating until no more supported archives
   are found or `--max-depth` is reached.
 - Keep the original archives in place unless `--delete-archives` is set.
 - With `--delete-archives`, delete each archive only after it has been
-  successfully extracted in the current run.
+  successfully extracted in the current run. Split archive groups are deleted
+  together after the first volume extracts successfully.
 - Skip extraction if the destination folder already exists, which makes repeat
   runs safer.
 
@@ -158,6 +163,14 @@ extension to be treated as an archive type:
 
 ```bash
 python3 nas_file_manager.py deep-extract /Volumes/NAS --apply --delete-archives --force-extension .mp4=zip
+```
+
+If only the already-visible files should be treated this way, and extracted
+contents should go back to normal archive detection, limit forced extensions to
+the first extraction pass:
+
+```bash
+python3 nas_file_manager.py deep-extract /Volumes/NAS --apply --delete-archives --force-extension .mp4=zip --force-extension-first-pass-only
 ```
 
 Use forced extensions only when you are sure those files are disguised

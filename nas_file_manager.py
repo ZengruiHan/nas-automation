@@ -13,6 +13,7 @@ import getpass
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -48,6 +49,16 @@ ARCHIVE_SUFFIX_ALIASES = {
     "tar_xz": (".tar.xz", ".txz"),
 }
 EXTERNAL_EXTRACTORS = ("7zz", "7z", "7za")
+NUMBERED_SPLIT_ARCHIVE_RE = re.compile(
+    r"^(?P<stem>.+)\.(?P<kind>zip|rar|7z)\.(?P<part>\d{3,})$",
+    re.IGNORECASE,
+)
+RAR_PART_SPLIT_ARCHIVE_RE = re.compile(
+    r"^(?P<stem>.+)\.part(?P<part>\d+)\.rar$",
+    re.IGNORECASE,
+)
+RAR_OLD_SPLIT_FOLLOWER_RE = re.compile(r"^(?P<stem>.+)\.r(?P<part>\d{2,3})$", re.IGNORECASE)
+ZIP_OLD_SPLIT_FOLLOWER_RE = re.compile(r"^(?P<stem>.+)\.z(?P<part>\d{2,3})$", re.IGNORECASE)
 VIDEO_EXTENSIONS = {
     ".3g2",
     ".3gp",
@@ -102,6 +113,16 @@ class Config:
     ignore_files: tuple[str, ...]
     ignore_dirs: tuple[str, ...]
     organize_rules: tuple[Rule, ...]
+
+
+@dataclass(frozen=True)
+class SplitArchiveInfo:
+    kind: str
+    family: str
+    stem: str
+    part_number: int
+    part_width: int
+    is_first_volume: bool
 
 
 class ConfigError(ValueError):
@@ -456,7 +477,143 @@ def find_duplicates(root: Path, min_size_mb: float, export_csv: Path | None, inc
     return 0
 
 
+def split_archive_info(path: Path) -> SplitArchiveInfo | None:
+    name = path.name
+
+    numbered = NUMBERED_SPLIT_ARCHIVE_RE.match(name)
+    if numbered:
+        part_text = numbered.group("part")
+        part_number = int(part_text)
+        return SplitArchiveInfo(
+            kind=numbered.group("kind").lower(),
+            family="numbered",
+            stem=numbered.group("stem"),
+            part_number=part_number,
+            part_width=len(part_text),
+            is_first_volume=part_number == 1,
+        )
+
+    rar_part = RAR_PART_SPLIT_ARCHIVE_RE.match(name)
+    if rar_part:
+        part_text = rar_part.group("part")
+        part_number = int(part_text)
+        return SplitArchiveInfo(
+            kind="rar",
+            family="rar_part",
+            stem=rar_part.group("stem"),
+            part_number=part_number,
+            part_width=len(part_text),
+            is_first_volume=part_number == 1,
+        )
+
+    rar_old = RAR_OLD_SPLIT_FOLLOWER_RE.match(name)
+    if rar_old:
+        part_text = rar_old.group("part")
+        return SplitArchiveInfo(
+            kind="rar",
+            family="rar_old",
+            stem=rar_old.group("stem"),
+            part_number=int(part_text) + 2,
+            part_width=len(part_text),
+            is_first_volume=False,
+        )
+
+    zip_old = ZIP_OLD_SPLIT_FOLLOWER_RE.match(name)
+    if zip_old:
+        part_text = zip_old.group("part")
+        return SplitArchiveInfo(
+            kind="zip",
+            family="zip_old",
+            stem=zip_old.group("stem"),
+            part_number=int(part_text),
+            part_width=len(part_text),
+            is_first_volume=False,
+        )
+
+    return None
+
+
+def same_split_archive_group(left: SplitArchiveInfo, right: SplitArchiveInfo) -> bool:
+    if left.family != right.family or left.kind != right.kind:
+        return False
+    if left.stem.casefold() != right.stem.casefold():
+        return False
+    if left.family == "numbered" and left.part_width != right.part_width:
+        return False
+    return True
+
+
+def split_archive_volumes(path: Path) -> tuple[Path, ...]:
+    info = split_archive_info(path)
+    if not info or not info.is_first_volume:
+        return (path,)
+
+    try:
+        siblings = list(path.parent.iterdir())
+    except OSError:
+        return (path,)
+
+    volumes: list[tuple[int, str, Path]] = []
+    for sibling in siblings:
+        if not sibling.is_file():
+            continue
+        sibling_info = split_archive_info(sibling)
+        if sibling_info and same_split_archive_group(info, sibling_info):
+            volumes.append((sibling_info.part_number, sibling.name.casefold(), sibling))
+
+    volumes.sort()
+    return tuple(volume for _part_number, _name, volume in volumes) or (path,)
+
+
+def old_style_split_companions(path: Path) -> tuple[Path, ...]:
+    suffix = path.suffix.lower()
+    if suffix not in {".rar", ".zip"}:
+        return ()
+
+    stem = path.with_suffix("").name.casefold()
+    pattern = RAR_OLD_SPLIT_FOLLOWER_RE if suffix == ".rar" else ZIP_OLD_SPLIT_FOLLOWER_RE
+
+    try:
+        siblings = list(path.parent.iterdir())
+    except OSError:
+        return ()
+
+    companions: list[tuple[int, str, Path]] = []
+    for sibling in siblings:
+        if not sibling.is_file():
+            continue
+        match = pattern.match(sibling.name)
+        if match and match.group("stem").casefold() == stem:
+            companions.append((int(match.group("part")), sibling.name.casefold(), sibling))
+
+    companions.sort()
+    return tuple(companion for _part_number, _name, companion in companions)
+
+
+def archive_delete_targets(path: Path) -> tuple[Path, ...]:
+    targets = list(split_archive_volumes(path))
+    targets.extend(old_style_split_companions(path))
+
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for target in targets:
+        resolved = target.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(target)
+    return tuple(unique)
+
+
+def archive_uses_split_volumes(path: Path) -> bool:
+    return split_archive_info(path) is not None or bool(old_style_split_companions(path))
+
+
 def archive_type(path: Path, forced_extensions: dict[str, str] | None = None) -> str | None:
+    split_info = split_archive_info(path)
+    if split_info:
+        return split_info.kind if split_info.is_first_volume else None
+
     try:
         with path.open("rb") as handle:
             header = handle.read(512)
@@ -514,6 +671,9 @@ def archive_type_from_suffix(path: Path) -> str | None:
 
 
 def corrected_archive_path(path: Path, kind: str) -> Path:
+    split_info = split_archive_info(path)
+    if split_info and split_info.is_first_volume:
+        return path
     suffix = ARCHIVE_SUFFIXES[kind]
     if has_archive_suffix(path, kind):
         return path
@@ -523,6 +683,10 @@ def corrected_archive_path(path: Path, kind: str) -> Path:
 
 
 def default_extract_dir(path: Path) -> Path:
+    split_info = split_archive_info(path)
+    if split_info:
+        return path.with_name(split_info.stem)
+
     lower_name = path.name.lower()
     for suffixes in ARCHIVE_SUFFIX_ALIASES.values():
         for suffix in sorted(suffixes, key=len, reverse=True):
@@ -532,6 +696,9 @@ def default_extract_dir(path: Path) -> Path:
 
 
 def has_archive_suffix(path: Path, kind: str) -> bool:
+    split_info = split_archive_info(path)
+    if split_info and split_info.is_first_volume:
+        return split_info.kind == kind
     lower_name = path.name.lower()
     return any(lower_name.endswith(suffix) for suffix in ARCHIVE_SUFFIX_ALIASES[kind])
 
@@ -735,7 +902,11 @@ def extract_archive_to_dir(
         extract_tar_to_dir(archive_path, extract_dir)
         return
 
-    if archive_kind == "zip" and prefer_7z_for_zip and find_external_extractor(extractor):
+    split_archive = archive_uses_split_volumes(archive_path)
+    if archive_kind == "zip" and split_archive and not find_external_extractor(extractor):
+        raise ArchiveUnsupportedError("split ZIP extraction requires 7zz, 7z, or 7za on PATH")
+
+    if archive_kind == "zip" and (split_archive or prefer_7z_for_zip) and find_external_extractor(extractor):
         try:
             extract_with_7z(archive_path, extract_dir, passwords, extractor)
             return
@@ -743,6 +914,9 @@ def extract_archive_to_dir(
             seven_zip_error = exc
     else:
         seven_zip_error = None
+
+    if archive_kind == "zip" and split_archive:
+        raise seven_zip_error or ArchiveUnsupportedError("split ZIP extraction requires 7zz, 7z, or 7za on PATH")
 
     if archive_kind == "zip":
         try:
@@ -854,6 +1028,7 @@ def preview_deep_unzip(
     delete_archives: bool,
     extractor: str | None,
     forced_extensions: dict[str, str] | None,
+    force_extensions_first_pass_only: bool,
     prefer_7z_for_zip: bool,
 ) -> int:
     candidates = list_archive_candidates(root, include_symlinks, forced_extensions)
@@ -869,6 +1044,8 @@ def preview_deep_unzip(
             print(f"ZIP archives will be extracted with: {external_extractor}")
         else:
             print("Warning: --prefer-7z was set, but 7zz/7z/7za was not found. ZIP extraction will use Python.")
+    if forced_extensions and force_extensions_first_pass_only:
+        print("Forced extensions will only be used during the first extraction pass.")
 
     print(f"Found {len(candidates)} supported archive(s) under {root}")
     for path, kind in candidates:
@@ -881,11 +1058,21 @@ def preview_deep_unzip(
         if extract_dir.exists():
             print(f"[DRY-RUN] skip extract {extract_from} ({kind}): output exists at {extract_dir}")
             if delete_archives:
-                print(f"[DRY-RUN] keep {extract_from}: not extracted in this run")
+                delete_targets = archive_delete_targets(extract_from)
+                if len(delete_targets) > 1:
+                    print(f"[DRY-RUN] keep split archive group: not extracted in this run")
+                else:
+                    print(f"[DRY-RUN] keep {extract_from}: not extracted in this run")
         else:
             print(f"[DRY-RUN] extract {extract_from} ({kind}) -> {extract_dir}")
             if delete_archives:
-                print(f"[DRY-RUN] delete {extract_from} after successful extraction")
+                delete_targets = archive_delete_targets(extract_from)
+                if len(delete_targets) == 1:
+                    print(f"[DRY-RUN] delete {extract_from} after successful extraction")
+                else:
+                    print(f"[DRY-RUN] delete split archive group after successful extraction:")
+                    for target in delete_targets:
+                        print(f"  {target}")
 
     print("\nNo files changed. Re-run with --apply to rename and extract.")
     print("Dry-run only shows currently visible archive layers; deeper layers appear after extraction.")
@@ -901,6 +1088,7 @@ def deep_unzip(
     delete_archives: bool,
     extractor: str | None,
     forced_extensions: dict[str, str] | None,
+    force_extensions_first_pass_only: bool,
     prefer_7z_for_zip: bool,
 ) -> int:
     if not root.exists():
@@ -914,6 +1102,7 @@ def deep_unzip(
             delete_archives,
             extractor,
             forced_extensions,
+            force_extensions_first_pass_only,
             prefer_7z_for_zip,
         )
 
@@ -925,9 +1114,14 @@ def deep_unzip(
     failed = 0
 
     for depth in range(1, max_depth + 1):
+        active_forced_extensions = (
+            forced_extensions
+            if forced_extensions and (depth == 1 or not force_extensions_first_pass_only)
+            else None
+        )
         candidates = [
             (path, kind)
-            for path, kind in list_archive_candidates(root, include_symlinks, forced_extensions)
+            for path, kind in list_archive_candidates(root, include_symlinks, active_forced_extensions)
             if path.resolve() not in processed
         ]
         if not candidates:
@@ -950,7 +1144,11 @@ def deep_unzip(
             if extract_dir.exists():
                 print(f"[SKIP] extract {current} ({kind}): output exists at {extract_dir}")
                 if delete_archives:
-                    print(f"[SKIP] keep {current}: archive was not extracted in this run")
+                    delete_targets = archive_delete_targets(current)
+                    if len(delete_targets) > 1:
+                        print(f"[SKIP] keep split archive group: archive was not extracted in this run")
+                    else:
+                        print(f"[SKIP] keep {current}: archive was not extracted in this run")
                 skipped += 1
                 processed.add(current.resolve())
                 continue
@@ -967,14 +1165,15 @@ def deep_unzip(
             else:
                 extracted += 1
                 if delete_archives:
-                    print(f"[APPLY] delete {current}")
-                    try:
-                        current.unlink()
-                    except OSError as exc:
-                        print(f"[SKIP] could not delete {current}: {exc}")
-                        failed += 1
-                    else:
-                        deleted += 1
+                    for target in archive_delete_targets(current):
+                        print(f"[APPLY] delete {target}")
+                        try:
+                            target.unlink()
+                        except OSError as exc:
+                            print(f"[SKIP] could not delete {target}: {exc}")
+                            failed += 1
+                        else:
+                            deleted += 1
             finally:
                 processed.add(current.resolve())
     else:
@@ -1157,6 +1356,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="treat files with an extension as an archive type, e.g. .mp4=zip; can be repeated",
     )
     deep_unzip_parser.add_argument(
+        "--force-extension-first-pass-only",
+        action="store_true",
+        help="use --force-extension rules only during the first extraction pass",
+    )
+    deep_unzip_parser.add_argument(
         "--password",
         action="append",
         default=[],
@@ -1212,6 +1416,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.delete_archives,
                 args.extractor,
                 forced_extensions,
+                args.force_extension_first_pass_only,
                 args.prefer_7z,
             )
 
