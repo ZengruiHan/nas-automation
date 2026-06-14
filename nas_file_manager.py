@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import zipfile
 from collections import Counter, defaultdict
@@ -27,6 +28,12 @@ from typing import Any, Iterable
 DEFAULT_IGNORE_FILES = {".DS_Store", "Thumbs.db"}
 DEFAULT_IGNORE_DIRS = {".git", "__pycache__", "@eaDir", "#recycle", ".Trash", ".Trashes"}
 HASH_CHUNK_SIZE = 1024 * 1024
+ARCHIVE_SUFFIXES = {
+    "zip": ".zip",
+    "rar": ".rar",
+    "7z": ".7z",
+}
+EXTERNAL_EXTRACTORS = ("7zz", "7z", "7za")
 
 
 @dataclass(frozen=True)
@@ -411,6 +418,29 @@ def find_duplicates(root: Path, min_size_mb: float, export_csv: Path | None, inc
     return 0
 
 
+def archive_type(path: Path) -> str | None:
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(8)
+    except OSError:
+        return None
+
+    if header.startswith(b"7z\xbc\xaf\x27\x1c"):
+        return "7z"
+    if header.startswith(b"Rar!\x1a\x07\x00") or header.startswith(b"Rar!\x1a\x07\x01\x00"):
+        return "rar"
+    try:
+        if zipfile.is_zipfile(path):
+            return "zip"
+    except OSError:
+        return None
+    return None
+
+
+def is_supported_archive(path: Path) -> bool:
+    return archive_type(path) is not None
+
+
 def is_zip_archive(path: Path) -> bool:
     try:
         return path.is_file() and zipfile.is_zipfile(path)
@@ -418,12 +448,13 @@ def is_zip_archive(path: Path) -> bool:
         return False
 
 
-def corrected_zip_path(path: Path) -> Path:
-    if path.suffix.lower() == ".zip":
+def corrected_archive_path(path: Path, kind: str) -> Path:
+    suffix = ARCHIVE_SUFFIXES[kind]
+    if path.suffix.lower() == suffix:
         return path
     if path.suffix:
-        return path.with_suffix(".zip")
-    return path.with_name(path.name + ".zip")
+        return path.with_suffix(suffix)
+    return path.with_name(path.name + suffix)
 
 
 def default_extract_dir(path: Path) -> Path:
@@ -490,6 +521,100 @@ def extract_zip_to_dir(zip_path: Path, extract_dir: Path, passwords: list[str]) 
     raise ArchivePasswordError(detail)
 
 
+def find_external_extractor(extractor: str | None = None) -> str | None:
+    if extractor:
+        expanded = Path(extractor).expanduser()
+        if expanded.exists():
+            return str(expanded)
+        return shutil.which(extractor)
+    for candidate in EXTERNAL_EXTRACTORS:
+        path = shutil.which(candidate)
+        if path:
+            return path
+    return None
+
+
+def extract_with_7z(
+    archive_path: Path,
+    extract_dir: Path,
+    passwords: list[str],
+    extractor: str | None,
+) -> None:
+    executable = find_external_extractor(extractor)
+    if not executable:
+        raise ArchiveUnsupportedError("RAR/7Z extraction requires 7zz, 7z, or 7za on PATH")
+
+    candidates: list[str | None] = [None] + passwords
+    errors: list[str] = []
+
+    for password in candidates:
+        staging = unique_destination(extract_dir.with_name(extract_dir.name + ".__extracting__"))
+        staging.mkdir(parents=True, exist_ok=False)
+        command = [
+            executable,
+            "x",
+            "-y",
+            "-bd",
+            "-bso0",
+            "-bsp0",
+            f"-o{staging}",
+        ]
+        if password is not None:
+            command.append(f"-p{password}")
+        else:
+            command.append("-p")
+        command.append(str(archive_path))
+
+        try:
+            result = subprocess.run(
+                command,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=None,
+            )
+            if result.returncode == 0:
+                staging.rename(extract_dir)
+                return
+            errors.append(summarize_extractor_error(result.stderr or result.stdout))
+        except OSError as exc:
+            errors.append(str(exc))
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+
+    detail = "; ".join(error for error in errors if error) or "extractor failed"
+    if "password" in detail.lower() or "wrong password" in detail.lower():
+        raise ArchivePasswordError(detail)
+    raise ArchiveError(detail)
+
+
+def summarize_extractor_error(output: str) -> str:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines:
+        return "extractor failed"
+    return " | ".join(lines[-4:])
+
+
+def extract_archive_to_dir(
+    archive_path: Path,
+    archive_kind: str,
+    extract_dir: Path,
+    passwords: list[str],
+    extractor: str | None,
+) -> None:
+    if archive_kind == "zip":
+        try:
+            extract_zip_to_dir(archive_path, extract_dir, passwords)
+            return
+        except ArchiveUnsupportedError:
+            pass
+        except ArchiveError:
+            raise
+
+    extract_with_7z(archive_path, extract_dir, passwords, extractor)
+
+
 def apply_zip_mtime(target: Path, info: zipfile.ZipInfo) -> None:
     try:
         mtime = datetime(*info.date_time).timestamp()
@@ -513,7 +638,7 @@ def load_passwords(values: list[str], password_file: str | None, ask_password: b
                 passwords.append(value)
 
     if ask_password:
-        value = getpass.getpass("ZIP password to try: ")
+        value = getpass.getpass("Archive password to try: ")
         if value:
             passwords.append(value)
 
@@ -531,39 +656,57 @@ def dedupe_preserve_order(values: Iterable[str]) -> list[str]:
     return result
 
 
+def list_archive_candidates(root: Path, include_symlinks: bool) -> list[tuple[Path, str]]:
+    candidates: list[tuple[Path, str]] = []
+    for path in iter_files(root, recursive=True, include_symlinks=include_symlinks):
+        kind = archive_type(path)
+        if kind:
+            candidates.append((path, kind))
+    return candidates
+
+
 def list_zip_candidates(root: Path, include_symlinks: bool) -> list[Path]:
     return [
         path
-        for path in iter_files(root, recursive=True, include_symlinks=include_symlinks)
-        if is_zip_archive(path)
+        for path, kind in list_archive_candidates(root, include_symlinks)
+        if kind == "zip"
     ]
 
 
-def preview_deep_unzip(root: Path, include_symlinks: bool, delete_archives: bool) -> int:
-    candidates = list_zip_candidates(root, include_symlinks)
+def preview_deep_unzip(
+    root: Path,
+    include_symlinks: bool,
+    delete_archives: bool,
+    extractor: str | None,
+) -> int:
+    candidates = list_archive_candidates(root, include_symlinks)
     if not candidates:
-        print(f"No ZIP archives found under {root}")
+        print(f"No supported archives found under {root}")
         return 0
 
-    print(f"Found {len(candidates)} ZIP archive(s) under {root}")
-    for path in candidates:
-        corrected = corrected_zip_path(path)
+    external_extractor = find_external_extractor(extractor)
+    if any(kind in {"rar", "7z"} for _path, kind in candidates) and not external_extractor:
+        print("Warning: RAR/7Z extraction requires 7zz, 7z, or 7za on PATH.")
+
+    print(f"Found {len(candidates)} supported archive(s) under {root}")
+    for path, kind in candidates:
+        corrected = corrected_archive_path(path, kind)
         if corrected != path:
             corrected = unique_destination(corrected)
             print(f"[DRY-RUN] rename {path} -> {corrected}")
         extract_from = corrected
         extract_dir = default_extract_dir(extract_from)
         if extract_dir.exists():
-            print(f"[DRY-RUN] skip extract {extract_from}: output exists at {extract_dir}")
+            print(f"[DRY-RUN] skip extract {extract_from} ({kind}): output exists at {extract_dir}")
             if delete_archives:
                 print(f"[DRY-RUN] keep {extract_from}: not extracted in this run")
         else:
-            print(f"[DRY-RUN] extract {extract_from} -> {extract_dir}")
+            print(f"[DRY-RUN] extract {extract_from} ({kind}) -> {extract_dir}")
             if delete_archives:
                 print(f"[DRY-RUN] delete {extract_from} after successful extraction")
 
     print("\nNo files changed. Re-run with --apply to rename and extract.")
-    print("Dry-run only shows currently visible ZIP layers; deeper layers appear after extraction.")
+    print("Dry-run only shows currently visible archive layers; deeper layers appear after extraction.")
     return 0
 
 
@@ -574,13 +717,14 @@ def deep_unzip(
     max_depth: int,
     include_symlinks: bool,
     delete_archives: bool,
+    extractor: str | None,
 ) -> int:
     if not root.exists():
         raise FileNotFoundError(root)
     if max_depth < 1:
         raise ValueError("--max-depth must be at least 1")
     if not apply:
-        return preview_deep_unzip(root, include_symlinks, delete_archives)
+        return preview_deep_unzip(root, include_symlinks, delete_archives, extractor)
 
     processed: set[Path] = set()
     renamed = 0
@@ -591,18 +735,18 @@ def deep_unzip(
 
     for depth in range(1, max_depth + 1):
         candidates = [
-            path
-            for path in list_zip_candidates(root, include_symlinks)
+            (path, kind)
+            for path, kind in list_archive_candidates(root, include_symlinks)
             if path.resolve() not in processed
         ]
         if not candidates:
-            print("\nNo more ZIP archives found.")
+            print("\nNo more supported archives found.")
             break
 
-        print(f"\nPass {depth}: {len(candidates)} ZIP archive(s)")
-        for path in candidates:
+        print(f"\nPass {depth}: {len(candidates)} supported archive(s)")
+        for path, kind in candidates:
             current = path
-            corrected = corrected_zip_path(current)
+            corrected = corrected_archive_path(current, kind)
             if corrected != current:
                 corrected = unique_destination(corrected)
                 print(f"[APPLY] rename {current} -> {corrected}")
@@ -613,16 +757,16 @@ def deep_unzip(
 
             extract_dir = default_extract_dir(current)
             if extract_dir.exists():
-                print(f"[SKIP] extract {current}: output exists at {extract_dir}")
+                print(f"[SKIP] extract {current} ({kind}): output exists at {extract_dir}")
                 if delete_archives:
                     print(f"[SKIP] keep {current}: archive was not extracted in this run")
                 skipped += 1
                 processed.add(current.resolve())
                 continue
 
-            print(f"[APPLY] extract {current} -> {extract_dir}")
+            print(f"[APPLY] extract {current} ({kind}) -> {extract_dir}")
             try:
-                extract_zip_to_dir(current, extract_dir, passwords)
+                extract_archive_to_dir(current, kind, extract_dir, passwords, extractor)
             except ArchivePasswordError as exc:
                 print(f"[SKIP] {current}: {exc}")
                 failed += 1
@@ -698,7 +842,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     deep_unzip_parser = subparsers.add_parser(
         "deep-unzip",
-        help="fix ZIP suffixes and recursively extract nested ZIP archives",
+        aliases=["deep-extract"],
+        help="fix archive suffixes and recursively extract nested ZIP/RAR/7Z archives",
     )
     deep_unzip_parser.add_argument("root", help="folder to scan")
     deep_unzip_parser.add_argument("--apply", action="store_true", help="actually rename and extract archives")
@@ -709,10 +854,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     deep_unzip_parser.add_argument("--max-depth", type=int, default=20, help="maximum recursive extraction passes")
     deep_unzip_parser.add_argument(
+        "--extractor",
+        help="path or command name for 7z/7zz/7za, required for RAR and 7Z extraction",
+    )
+    deep_unzip_parser.add_argument(
         "--password",
         action="append",
         default=[],
-        help="ZIP password to try; can be repeated",
+        help="archive password to try; can be repeated",
     )
     deep_unzip_parser.add_argument("--password-file", help="text file with one password per line")
     deep_unzip_parser.add_argument("--ask-password", action="store_true", help="prompt for one password")
@@ -749,7 +898,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.include_symlinks,
             )
 
-        if args.command == "deep-unzip":
+        if args.command in {"deep-unzip", "deep-extract"}:
             passwords = load_passwords(args.password, args.password_file, args.ask_password)
             return deep_unzip(
                 expand_path(args.root),
@@ -758,6 +907,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.max_depth,
                 args.include_symlinks,
                 args.delete_archives,
+                args.extractor,
             )
 
         if args.command == "clean-empty-dirs":

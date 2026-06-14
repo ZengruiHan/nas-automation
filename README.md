@@ -17,29 +17,30 @@ Find duplicates without deleting anything:
 python3 nas_file_manager.py duplicates /Volumes/NAS --min-size-mb 5 --export-csv duplicates.csv
 ```
 
-Preview recursive ZIP extraction:
+Preview recursive archive extraction:
 
 ```bash
-python3 nas_file_manager.py deep-unzip /Volumes/NAS
+python3 nas_file_manager.py deep-extract /Volumes/NAS
 ```
 
-Fix missing or wrong ZIP suffixes and recursively extract nested ZIP files:
+Fix missing or wrong archive suffixes and recursively extract nested ZIP, RAR,
+and 7Z files:
 
 ```bash
-python3 nas_file_manager.py deep-unzip /Volumes/NAS --apply
+python3 nas_file_manager.py deep-extract /Volumes/NAS --apply
 ```
 
-Keep only the final extracted contents by deleting each ZIP after successful
+Keep only the final extracted contents by deleting each archive after successful
 extraction:
 
 ```bash
-python3 nas_file_manager.py deep-unzip /Volumes/NAS --apply --delete-archives
+python3 nas_file_manager.py deep-extract /Volumes/NAS --apply --delete-archives
 ```
 
 Try passwords while extracting encrypted ZIP files:
 
 ```bash
-python3 nas_file_manager.py deep-unzip /Volumes/NAS --apply --delete-archives --password-file passwords.txt
+python3 nas_file_manager.py deep-extract /Volumes/NAS --apply --delete-archives --password-file passwords.txt
 ```
 
 Preview rule-based organization:
@@ -82,19 +83,20 @@ Edit `nas_rules.example.json` or copy it to your own config file. A rule has:
 The script never deletes duplicate files. The `duplicates` command reports them
 and can export a CSV so you can review before deciding what to remove.
 
-## Deep ZIP Extraction
+## Deep Archive Extraction
 
-The `deep-unzip` command scans every file under a root and identifies ZIP
-archives by content, not by filename. This catches archives with no extension or
-with the wrong extension.
+The `deep-extract` command scans every file under a root and identifies ZIP,
+RAR, and 7Z archives by content, not by filename. This catches archives with no
+extension or with the wrong extension. `deep-unzip` remains available as a
+backward-compatible alias.
 
-For each ZIP archive, it will:
+For each supported archive, it will:
 
-- Rename the file to a `.zip` suffix when the suffix is missing or wrong.
+- Rename the file to `.zip`, `.rar`, or `.7z` when the suffix is missing or wrong.
 - Extract it into a sibling folder with the same base name.
-- Scan the extracted contents again, repeating until no more ZIP archives are
-  found or `--max-depth` is reached.
-- Keep the original ZIP files in place unless `--delete-archives` is set.
+- Scan the extracted contents again, repeating until no more supported archives
+  are found or `--max-depth` is reached.
+- Keep the original archives in place unless `--delete-archives` is set.
 - With `--delete-archives`, delete each archive only after it has been
   successfully extracted in the current run.
 - Skip extraction if the destination folder already exists, which makes repeat
@@ -103,15 +105,21 @@ For each ZIP archive, it will:
 Examples:
 
 ```bash
-python3 nas_file_manager.py deep-unzip /Volumes/NAS
-python3 nas_file_manager.py deep-unzip /Volumes/NAS --apply --max-depth 50
-python3 nas_file_manager.py deep-unzip /Volumes/NAS --apply --delete-archives
-python3 nas_file_manager.py deep-unzip /Volumes/NAS --apply --password "secret"
-python3 nas_file_manager.py deep-unzip /Volumes/NAS --apply --password-file passwords.txt
-python3 nas_file_manager.py deep-unzip /Volumes/NAS --apply --ask-password
+python3 nas_file_manager.py deep-extract /Volumes/NAS
+python3 nas_file_manager.py deep-extract /Volumes/NAS --apply --max-depth 50
+python3 nas_file_manager.py deep-extract /Volumes/NAS --apply --delete-archives
+python3 nas_file_manager.py deep-extract /Volumes/NAS --apply --password "secret"
+python3 nas_file_manager.py deep-extract /Volumes/NAS --apply --password-file passwords.txt
+python3 nas_file_manager.py deep-extract /Volumes/NAS --apply --ask-password
 ```
 
 Password files use one password per line. Blank lines and lines starting with
-`#` are ignored. Python's standard ZIP support handles common ZIP encryption; if
-an archive uses unsupported ZIP features, the script reports that file and keeps
-going.
+`#` are ignored. ZIP files can be extracted with Python's standard library. RAR
+and 7Z files require `7zz`, `7z`, or `7za` on `PATH`, or a path supplied with
+`--extractor`.
+
+Example with an explicit extractor:
+
+```bash
+python3 nas_file_manager.py deep-extract /Volumes/NAS --apply --delete-archives --extractor /usr/bin/7z
+```
