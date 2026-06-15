@@ -79,6 +79,24 @@ Actually remove empty folders:
 python3 nas_file_manager.py clean-empty-dirs /Volumes/NAS --apply
 ```
 
+## Collapse Redundant Folders
+
+The `collapse-dirs` command removes folder shells where a directory contains no
+files and only one child directory. By default, it keeps the deepest folder in
+the chain and moves that folder up, then removes the emptied parent folders.
+
+For example, `Outer/Middle/Inner/file.mp4` becomes `Inner/file.mp4`. The command
+keeps the root you pass in place and defaults to dry-run mode. Use `--keep top`
+to keep the first folder under the root instead.
+
+Examples:
+
+```bash
+python3 nas_file_manager.py collapse-dirs /Volumes/NAS
+python3 nas_file_manager.py collapse-dirs /Volumes/NAS --apply
+python3 nas_file_manager.py collapse-dirs /Volumes/NAS --keep top --apply
+```
+
 ## Rule Format
 
 Edit `nas_rules.example.json` or copy it to your own config file. A rule has:

@@ -1563,6 +1563,117 @@ def plan_clean_empty_dirs(root: Path) -> list[Operation]:
     return operations
 
 
+def plan_collapse_redundant_dirs(
+    root: Path,
+    keep: str = "bottom",
+    include_symlinks: bool = False,
+) -> list[Operation]:
+    if not root.exists():
+        return [Operation("skip", root, None, "root missing")]
+    if not root.is_dir():
+        raise ValueError(f"{root} is not a directory")
+    if keep not in {"bottom", "top"}:
+        raise ValueError("--keep must be either 'bottom' or 'top'")
+
+    root = root.resolve()
+    operations: list[Operation] = []
+    reserved_targets: set[Path] = set()
+    planned_dirs: set[Path] = set()
+
+    directories = sorted(
+        (Path(dirpath).resolve() for dirpath, _dirnames, _filenames in os.walk(root)),
+        key=lambda path: (len(path.relative_to(root).parts), str(path)),
+    )
+
+    for path in directories:
+        if path == root or path in planned_dirs or not path.exists():
+            continue
+
+        chain = redundant_dir_chain(path, include_symlinks)
+        if not chain:
+            continue
+
+        source_dir = chain[-1]
+        if source_dir == path:
+            continue
+
+        if keep == "bottom":
+            preferred_target = path.parent / source_dir.name
+            if preferred_target.resolve() == path.resolve():
+                shell_dirs = chain
+                operations.extend(plan_move_dir_children(source_dir, path, reserved_targets))
+            else:
+                shell_dirs = [path, *chain[:-1]]
+                target_dir = unique_destination_with_reserved(preferred_target, reserved_targets)
+                reserved_targets.add(target_dir.resolve())
+                operations.append(Operation("move", source_dir, target_dir, f"collapse redundant folders from {path}"))
+        else:
+            shell_dirs = chain
+            operations.extend(plan_move_dir_children(source_dir, path, reserved_targets))
+
+        for directory in reversed(shell_dirs):
+            operations.append(Operation("remove-empty-dir", directory, None, "redundant folder shell"))
+            planned_dirs.add(directory.resolve())
+
+    return operations
+
+
+def plan_move_dir_children(source_dir: Path, target_dir: Path, reserved_targets: set[Path]) -> list[Operation]:
+    operations: list[Operation] = []
+    try:
+        children = sorted(source_dir.iterdir(), key=lambda child: child.name.lower())
+    except OSError:
+        return operations
+
+    for child in children:
+        target = unique_destination_with_reserved(target_dir / child.name, reserved_targets)
+        reserved_targets.add(target.resolve())
+        operations.append(Operation("move", child, target, f"collapse redundant folders from {source_dir}"))
+    return operations
+
+
+def redundant_dir_chain(path: Path, include_symlinks: bool) -> list[Path]:
+    chain: list[Path] = []
+    current = path
+
+    while True:
+        child_dir = only_child_directory(current, include_symlinks)
+        if child_dir is None:
+            break
+        chain.append(child_dir.resolve())
+        current = child_dir
+
+    return chain
+
+
+def only_child_directory(path: Path, include_symlinks: bool) -> Path | None:
+    try:
+        children = list(path.iterdir())
+    except OSError:
+        return None
+
+    if len(children) != 1:
+        return None
+
+    child = children[0]
+    if child.is_symlink() and not include_symlinks:
+        return None
+    if not child.is_dir():
+        return None
+    return child
+
+
+def collapse_redundant_dirs(root: Path, keep: str, apply: bool, include_symlinks: bool) -> int:
+    operations = plan_collapse_redundant_dirs(root, keep, include_symlinks)
+    count = apply_operations(operations, apply=apply)
+
+    print("\nSummary:")
+    print(f"  Operations: {count}")
+    if not apply:
+        print("No files changed. Re-run with --apply to execute.")
+    return 0
+
+
 def is_video_file(path: Path, video_extensions: set[str] = VIDEO_EXTENSIONS) -> bool:
     return path.suffix.lower() in video_extensions
 
@@ -1721,6 +1832,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     duplicates_parser.add_argument("--min-size-mb", type=float, default=1.0, help="skip files smaller than this")
     duplicates_parser.add_argument("--export-csv", help="optional CSV output path")
 
+    collapse_parser = subparsers.add_parser(
+        "collapse-dirs",
+        help="collapse redundant single-child folder nesting",
+    )
+    collapse_parser.add_argument("root", help="folder whose redundant nesting should be collapsed")
+    collapse_parser.add_argument("--apply", action="store_true", help="actually move contents and remove folders")
+    collapse_parser.add_argument(
+        "--keep",
+        choices=("bottom", "top"),
+        default="bottom",
+        help="which folder in a redundant chain to keep; default keeps the deepest folder",
+    )
+
     flatten_videos_parser = subparsers.add_parser(
         "flatten-videos",
         help="move videos from subfolders to the root and remove emptied folders",
@@ -1818,6 +1942,9 @@ def main(argv: list[str] | None = None) -> int:
                 export_csv,
                 args.include_symlinks,
             )
+
+        if args.command == "collapse-dirs":
+            return collapse_redundant_dirs(expand_path(args.root), args.keep, args.apply, args.include_symlinks)
 
         if args.command == "flatten-videos":
             root = expand_path(args.root)
