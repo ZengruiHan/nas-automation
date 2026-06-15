@@ -98,8 +98,9 @@ and can export a CSV so you can review before deciding what to remove.
 ## Flatten Videos
 
 The `flatten-videos` command scans a root folder recursively and moves common
-video files from nested folders into the root folder itself. It then removes
-folders that became empty after the move.
+video files from nested folders into the root folder itself, or into a folder
+specified with `--target-dir`. It then removes folders that became empty after
+the move.
 
 Common video extensions include `.mp4`, `.mkv`, `.mov`, `.avi`, `.wmv`, `.flv`,
 `.webm`, `.m4v`, `.mpg`, `.mpeg`, `.3gp`, `.ts`, `.mts`, `.m2ts`, `.vob`,
@@ -108,11 +109,16 @@ Common video extensions include `.mp4`, `.mkv`, `.mov`, `.avi`, `.wmv`, `.flv`,
 If a file with the same name already exists in the root, the moved file gets a
 numbered suffix such as `movie (1).mp4`.
 
+Use `--rename-from-parent` to rename each moved video to the original video's
+deepest parent folder name. For example, `/Volumes/NAS/Show/Episode/file.mp4`
+can be moved as `Episode.mp4`.
+
 Examples:
 
 ```bash
 python3 nas_file_manager.py flatten-videos /Volumes/NAS
 python3 nas_file_manager.py flatten-videos /Volumes/NAS --apply
+python3 nas_file_manager.py flatten-videos /Volumes/NAS --target-dir /Volumes/Videos --rename-from-parent --apply
 ```
 
 ## Deep Archive Extraction

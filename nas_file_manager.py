@@ -1567,28 +1567,53 @@ def is_video_file(path: Path, video_extensions: set[str] = VIDEO_EXTENSIONS) -> 
     return path.suffix.lower() in video_extensions
 
 
-def plan_flatten_videos(root: Path, include_symlinks: bool = False) -> tuple[list[Operation], list[Operation]]:
+def plan_flatten_videos(
+    root: Path,
+    target_dir: Path | None = None,
+    rename_from_parent: bool = False,
+    include_symlinks: bool = False,
+) -> tuple[list[Operation], list[Operation]]:
     if not root.exists():
         return [Operation("skip", root, None, "root missing")], []
     if not root.is_dir():
         raise ValueError(f"{root} is not a directory")
 
     root = root.resolve()
+    target_dir = (target_dir or root).resolve()
     move_operations: list[Operation] = []
     reserved_targets: set[Path] = set()
+    skip_target_tree = target_dir != root and path_is_relative_to(target_dir, root)
 
     for path in iter_files(root, recursive=True, include_symlinks=include_symlinks):
         if not is_video_file(path):
             continue
-        if path.parent.resolve() == root:
+        if skip_target_tree and path_is_relative_to(path.resolve(), target_dir):
+            continue
+        if path.parent.resolve() == target_dir:
             continue
 
-        target = unique_destination_with_reserved(root / path.name, reserved_targets)
+        target_name = flatten_video_target_name(path, rename_from_parent)
+        target = unique_destination_with_reserved(target_dir / target_name, reserved_targets)
         reserved_targets.add(target.resolve())
         move_operations.append(Operation("move", path, target, "flatten video"))
 
-    empty_dir_operations = plan_empty_dirs_after_moves(root, move_operations)
+    empty_dir_operations = plan_empty_dirs_after_moves(root, move_operations, protected_dirs=(target_dir,))
     return move_operations, empty_dir_operations
+
+
+def flatten_video_target_name(path: Path, rename_from_parent: bool) -> str:
+    if not rename_from_parent:
+        return path.name
+    parent_name = path.parent.name.strip() or path.stem
+    return f"{parent_name}{path.suffix}"
+
+
+def path_is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
 
 
 def unique_destination_with_reserved(target: Path, reserved_targets: set[Path]) -> Path:
@@ -1606,14 +1631,19 @@ def unique_destination_with_reserved(target: Path, reserved_targets: set[Path]) 
     raise RuntimeError(f"Could not find a free destination for {target}")
 
 
-def plan_empty_dirs_after_moves(root: Path, move_operations: list[Operation]) -> list[Operation]:
+def plan_empty_dirs_after_moves(
+    root: Path,
+    move_operations: list[Operation],
+    protected_dirs: Iterable[Path] = (),
+) -> list[Operation]:
     moved_sources = {op.source.resolve() for op in move_operations if op.source}
+    protected = {root.resolve(), *(path.resolve() for path in protected_dirs)}
     planned_empty: set[Path] = set()
     operations: list[Operation] = []
 
     for dirpath, _dirnames, _filenames in os.walk(root, topdown=False):
         path = Path(dirpath)
-        if path == root:
+        if path.resolve() in protected:
             continue
 
         try:
@@ -1639,8 +1669,19 @@ def plan_empty_dirs_after_moves(root: Path, move_operations: list[Operation]) ->
     return operations
 
 
-def flatten_videos(root: Path, apply: bool, include_symlinks: bool) -> int:
-    move_operations, empty_dir_operations = plan_flatten_videos(root, include_symlinks)
+def flatten_videos(
+    root: Path,
+    target_dir: Path | None,
+    rename_from_parent: bool,
+    apply: bool,
+    include_symlinks: bool,
+) -> int:
+    move_operations, empty_dir_operations = plan_flatten_videos(
+        root,
+        target_dir=target_dir,
+        rename_from_parent=rename_from_parent,
+        include_symlinks=include_symlinks,
+    )
     move_count = apply_operations(move_operations, apply=apply)
     empty_count = apply_operations(empty_dir_operations, apply=apply)
 
@@ -1650,6 +1691,15 @@ def flatten_videos(root: Path, apply: bool, include_symlinks: bool) -> int:
     if not apply:
         print("No files changed. Re-run with --apply to execute.")
     return 0
+
+
+def resolve_flatten_target_dir(root: Path, value: str | None) -> Path | None:
+    if not value:
+        return None
+    target = Path(value).expanduser()
+    if target.is_absolute():
+        return target.resolve()
+    return (root / target).resolve()
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -1677,6 +1727,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     flatten_videos_parser.add_argument("root", help="folder whose top level should receive videos")
     flatten_videos_parser.add_argument("--apply", action="store_true", help="actually move videos and remove folders")
+    flatten_videos_parser.add_argument(
+        "--target-dir",
+        help="folder that should receive videos; relative paths are resolved under root",
+    )
+    flatten_videos_parser.add_argument(
+        "--rename-from-parent",
+        action="store_true",
+        help="rename moved videos to the original video's deepest parent folder name",
+    )
 
     deep_unzip_parser = subparsers.add_parser(
         "deep-unzip",
@@ -1761,7 +1820,14 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         if args.command == "flatten-videos":
-            return flatten_videos(expand_path(args.root), args.apply, args.include_symlinks)
+            root = expand_path(args.root)
+            return flatten_videos(
+                root,
+                resolve_flatten_target_dir(root, args.target_dir),
+                args.rename_from_parent,
+                args.apply,
+                args.include_symlinks,
+            )
 
         if args.command in {"deep-unzip", "deep-extract"}:
             passwords = load_passwords(args.password, args.password_file, args.ask_password)
