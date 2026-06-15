@@ -166,9 +166,11 @@ python3 nas_file_manager.py deep-extract /Volumes/NAS --apply --delete-archives 
 ```
 
 Old ZIP files created on Japanese Windows may store filenames as CP932/Shift-JIS
-instead of UTF-8. The Python ZIP extractor automatically tries common Japanese
-encodings when filenames look garbled. If a specific archive still extracts
-with mojibake, force the filename encoding:
+instead of UTF-8. When `7z`, `7zz`, or `7za` is available, the script tries 7-Zip
+first for these archives because it is usually faster on NAS hardware. If the
+extracted names look garbled, it discards that output and falls back to Python's
+ZIP extractor with common Japanese encodings. If a specific archive still
+extracts with mojibake, force the filename encoding:
 
 ```bash
 python3 nas_file_manager.py deep-extract /Volumes/NAS --apply --delete-archives --zip-name-encoding cp932

@@ -154,6 +154,10 @@ class ArchiveUnsupportedError(ArchiveError):
     """Raised when an archive uses features unsupported by available tools."""
 
 
+class ArchiveFilenameEncodingError(ArchiveError):
+    """Raised when extracted filenames look like mojibake."""
+
+
 class ArchiveUnsafePathError(ArchiveError):
     """Raised when a ZIP member would write outside the extraction folder."""
 
@@ -892,6 +896,21 @@ def zip_names_have_japanese_text(names: Iterable[str]) -> bool:
     return any(is_japanese_name_char(char) for name in names for char in name)
 
 
+def extracted_tree_names_look_mojibake(root: Path) -> bool:
+    names: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        names.extend(dirnames)
+        names.extend(filenames)
+        if len(names) >= 2000:
+            break
+
+    if not names:
+        return False
+
+    score = zip_name_mojibake_score(names)
+    return score >= max(8.0, len(names) * 1.5)
+
+
 def is_japanese_name_char(char: str) -> bool:
     code = ord(char)
     return (
@@ -1039,6 +1058,7 @@ def extract_with_7z(
     extract_dir: Path,
     passwords: list[str],
     extractor: str | None,
+    validate_filenames: bool = False,
 ) -> None:
     executable = find_external_extractor(extractor)
     if not executable:
@@ -1079,6 +1099,10 @@ def extract_with_7z(
                     timeout=None,
                 )
                 if result.returncode == 0:
+                    if validate_filenames and extracted_tree_names_look_mojibake(staging):
+                        raise ArchiveFilenameEncodingError(
+                            "7z extracted filenames look garbled; retrying Python ZIP filename decoding"
+                        )
                     staging.rename(extract_dir)
                     return
                 errors.append(summarize_extractor_error(result.stderr or result.stdout))
@@ -1121,6 +1145,13 @@ def extract_archive_to_dir(
     if archive_kind == "zip" and split_archive and not find_external_extractor(extractor):
         raise ArchiveUnsupportedError("split ZIP extraction requires 7zz, 7z, or 7za on PATH")
 
+    detected_zip_name_encoding: str | None = None
+    if archive_kind == "zip" and not split_archive and not zip_name_encodings:
+        try:
+            detected_zip_name_encoding = select_zip_name_encoding(archive_path, [])
+        except ArchiveError:
+            detected_zip_name_encoding = None
+
     python_zip_tried = False
     python_zip_error: ArchiveError | None = None
     if archive_kind == "zip" and zip_name_encodings and not split_archive:
@@ -1131,10 +1162,28 @@ def extract_archive_to_dir(
         except ArchiveError as exc:
             python_zip_error = exc
 
-    if archive_kind == "zip" and (split_archive or prefer_7z_for_zip or python_zip_error) and find_external_extractor(extractor):
+    if (
+        archive_kind == "zip"
+        and (split_archive or prefer_7z_for_zip or python_zip_error or detected_zip_name_encoding)
+        and find_external_extractor(extractor)
+    ):
         try:
-            extract_with_7z(archive_path, extract_dir, passwords, extractor)
+            if detected_zip_name_encoding and not prefer_7z_for_zip:
+                print(
+                    f"[INFO] ZIP filename encoding looks like {detected_zip_name_encoding}; "
+                    "trying 7z first for speed"
+                )
+            extract_with_7z(
+                archive_path,
+                extract_dir,
+                passwords,
+                extractor,
+                validate_filenames=detected_zip_name_encoding is not None,
+            )
             return
+        except ArchiveFilenameEncodingError as exc:
+            print(f"[INFO] {exc}")
+            seven_zip_error = exc
         except ArchiveError as exc:
             seven_zip_error = exc
     else:
