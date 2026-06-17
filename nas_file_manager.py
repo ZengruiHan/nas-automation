@@ -53,6 +53,31 @@ ARCHIVE_SUFFIX_ALIASES = {
 EXTERNAL_EXTRACTORS = ("7zz", "7z", "7za")
 DEFAULT_ZIP_NAME_ENCODINGS = ("cp932", "shift_jis")
 ZIP_UTF8_FLAG = 0x800
+SIZE_PATTERN = re.compile(
+    r"^\s*(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>b|bytes?|k|kb|kib|m|mb|mib|g|gb|gib|t|tb|tib|p|pb|pib)?\s*$",
+    re.IGNORECASE,
+)
+SIZE_UNITS = {
+    None: 1,
+    "b": 1,
+    "byte": 1,
+    "bytes": 1,
+    "k": 1024,
+    "kb": 1024,
+    "kib": 1024,
+    "m": 1024**2,
+    "mb": 1024**2,
+    "mib": 1024**2,
+    "g": 1024**3,
+    "gb": 1024**3,
+    "gib": 1024**3,
+    "t": 1024**4,
+    "tb": 1024**4,
+    "tib": 1024**4,
+    "p": 1024**5,
+    "pb": 1024**5,
+    "pib": 1024**5,
+}
 MOJIBAKE_CHARS = frozenset(
     "¡¢£¤¥¦§¨©ª«¬®¯°±²³´µ¶·¸¹º»¼½¾¿"
     "ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞß"
@@ -233,6 +258,20 @@ def _optional_float(value: Any) -> float | None:
     return float(value)
 
 
+def parse_size(value: str) -> int:
+    match = SIZE_PATTERN.match(value)
+    if not match:
+        raise ValueError(f"invalid size {value!r}; use values like 500B, 100KB, 5MB, or 1.5GB")
+
+    number = float(match.group("value"))
+    unit = match.group("unit")
+    multiplier = SIZE_UNITS[unit.lower() if unit else None]
+    size = int(number * multiplier)
+    if size == 0 and number > 0:
+        return 1
+    return size
+
+
 def resolve_config_path(value: str, roots: dict[str, Path]) -> Path:
     if value in roots:
         return roots[value]
@@ -404,6 +443,11 @@ def apply_operations(operations: Iterable[Operation], apply: bool) -> int:
             print(f"[{prefix}] remove empty dir {op.source} ({op.reason})")
             if apply:
                 op.source.rmdir()
+            count += 1
+        elif op.action == "delete-file" and op.source:
+            print(f"[{prefix}] delete file {op.source} ({op.reason})")
+            if apply:
+                op.source.unlink()
             count += 1
         elif op.action == "skip":
             print(f"[SKIP] {op.source}: {op.reason}")
@@ -1563,6 +1607,61 @@ def plan_clean_empty_dirs(root: Path) -> list[Operation]:
     return operations
 
 
+def plan_delete_small_files(root: Path, max_size: int, include_symlinks: bool = False) -> list[Operation]:
+    if not root.exists():
+        return [Operation("skip", root, None, "root missing")]
+    if not root.is_dir():
+        raise ValueError(f"{root} is not a directory")
+    if max_size < 0:
+        raise ValueError("size must not be negative")
+
+    operations: list[Operation] = []
+    for path in iter_files(
+        root,
+        ignore_files=(),
+        ignore_dirs=DEFAULT_IGNORE_DIRS,
+        recursive=True,
+        include_symlinks=include_symlinks,
+    ):
+        try:
+            size = path.stat().st_size
+        except OSError:
+            operations.append(Operation("skip", path, None, "could not read file size"))
+            continue
+
+        if size < max_size:
+            operations.append(
+                Operation(
+                    "delete-file",
+                    path,
+                    None,
+                    f"size {human_size(size)} < {human_size(max_size)}",
+                )
+            )
+    return operations
+
+
+def delete_small_files(root: Path, max_size: int, apply: bool, include_symlinks: bool) -> int:
+    operations = plan_delete_small_files(root, max_size, include_symlinks)
+    total_size = 0
+    for op in operations:
+        if op.action != "delete-file" or not op.source:
+            continue
+        try:
+            total_size += op.source.stat().st_size
+        except OSError:
+            pass
+
+    count = apply_operations(operations, apply=apply)
+
+    print("\nSummary:")
+    print(f"  Files matched: {count}")
+    print(f"  Total size:    {human_size(total_size)}")
+    if not apply:
+        print("No files changed. Re-run with --apply to execute.")
+    return 0
+
+
 def plan_collapse_redundant_dirs(
     root: Path,
     keep: str = "bottom",
@@ -1915,6 +2014,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     clean_parser.add_argument("root", help="folder to clean")
     clean_parser.add_argument("--apply", action="store_true", help="actually remove directories")
 
+    small_files_parser = subparsers.add_parser(
+        "delete-small-files",
+        help="delete files smaller than a size threshold",
+    )
+    small_files_parser.add_argument("root", help="folder to scan")
+    small_files_parser.add_argument(
+        "size",
+        help="delete files smaller than this size, e.g. 500B, 100KB, 5MB, or 1.5GB",
+    )
+    small_files_parser.add_argument("--apply", action="store_true", help="actually delete files")
+
     return parser.parse_args(argv)
 
 
@@ -1981,6 +2091,14 @@ def main(argv: list[str] | None = None) -> int:
             if not args.apply:
                 print("No directories removed. Re-run with --apply to execute.")
             return 0
+
+        if args.command == "delete-small-files":
+            return delete_small_files(
+                expand_path(args.root),
+                parse_size(args.size),
+                args.apply,
+                args.include_symlinks,
+            )
     except (ConfigError, OSError, RuntimeError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2

@@ -79,6 +79,18 @@ Actually remove empty folders:
 python3 nas_file_manager.py clean-empty-dirs /Volumes/NAS --apply
 ```
 
+Preview deleting files smaller than a threshold:
+
+```bash
+python3 nas_file_manager.py delete-small-files /Volumes/NAS 5MB
+```
+
+Actually delete files smaller than the threshold:
+
+```bash
+python3 nas_file_manager.py delete-small-files /Volumes/NAS 5MB --apply
+```
+
 ## Collapse Redundant Folders
 
 The `collapse-dirs` command removes folder shells where a directory contains no
@@ -112,6 +124,23 @@ Edit `nas_rules.example.json` or copy it to your own config file. A rule has:
 
 The script never deletes duplicate files. The `duplicates` command reports them
 and can export a CSV so you can review before deciding what to remove.
+
+## Delete Small Files
+
+The `delete-small-files` command scans a root folder recursively and deletes
+files whose size is smaller than the threshold you provide. It defaults to
+dry-run mode and only deletes files when you add `--apply`.
+
+The size threshold accepts plain bytes or units such as `500B`, `100KB`, `5MB`,
+`1.5GB`, and `1TB`. The comparison is strictly smaller than the threshold, so a
+file that is exactly `5MB` is not deleted by `5MB`.
+
+Examples:
+
+```bash
+python3 nas_file_manager.py delete-small-files /Volumes/NAS 100KB
+python3 nas_file_manager.py delete-small-files /Volumes/NAS 100KB --apply
+```
 
 ## Flatten Videos
 
